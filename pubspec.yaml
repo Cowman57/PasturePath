@@ -1,0 +1,31 @@
+name: tractorgps
+description: PasturePath V4
+publish_to: "none"
+version: 4.0.0+1
+
+environment:
+  sdk: ">=3.9.0 <4.0.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_map: ^6.2.1
+  latlong2: ^0.9.1
+  file_picker: ^8.3.7
+  geolocator: ^13.0.1
+  shared_preferences: ^2.3.2
+  path_provider: ^2.1.5
+  share_plus: ^11.1.0
+  downloadsfolder: ^1.2.0
+  flutter_map_dragmarker: ^6.0.0
+
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^4.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
