@@ -244,6 +244,59 @@ List<List<LatLng>> clipLineABToPolygonExact(
   return segments;
 }
 
+/// Max |perpendicular| distance (metres) from [origin] along unit normal (east, north).
+double guidancePerpendicularExtentM({
+  required LatLng origin,
+  required double normalEast,
+  required double normalNorth,
+  required Iterable<List<LatLng>> outerRings,
+}) {
+  const rm = 111320.0;
+  final cosLat = math.cos(origin.latitude * math.pi / 180.0);
+  var maxAbs = 0.0;
+  for (final ring in outerRings) {
+    for (final p in ring) {
+      final east = (p.longitude - origin.longitude) * rm * cosLat;
+      final north = (p.latitude - origin.latitude) * rm;
+      final perp = east * normalEast + north * normalNorth;
+      maxAbs = math.max(maxAbs, perp.abs());
+    }
+  }
+  return maxAbs;
+}
+
+/// Max |along-track| distance (metres) from [origin] along unit tangent (east, north).
+double guidanceAlongTrackExtentM({
+  required LatLng origin,
+  required double tangentEast,
+  required double tangentNorth,
+  required Iterable<List<LatLng>> outerRings,
+}) {
+  const rm = 111320.0;
+  final cosLat = math.cos(origin.latitude * math.pi / 180.0);
+  var maxAbs = 0.0;
+  for (final ring in outerRings) {
+    for (final p in ring) {
+      final east = (p.longitude - origin.longitude) * rm * cosLat;
+      final north = (p.latitude - origin.latitude) * rm;
+      final along = east * tangentEast + north * tangentNorth;
+      maxAbs = math.max(maxAbs, along.abs());
+    }
+  }
+  return maxAbs;
+}
+
+/// Parallel guidance span from paddock width with safety margin and cap.
+double guidanceParallelSpanM({
+  required double perpendicularExtentM,
+  double safetyFactor = 2.0,
+  double capM = 500.0,
+  double minSpanM = 0.0,
+}) {
+  final span = perpendicularExtentM * safetyFactor;
+  return span.clamp(minSpanM, capM);
+}
+
 class _XY {
   final double x;
   final double y;
@@ -324,18 +377,150 @@ List<LatLng> simplifySwathPath(List<LatLng> path, {double minDistM = 0.55}) {
   return out;
 }
 
+double _bearingDeg(LatLng from, LatLng to) {
+  return const Distance().bearing(from, to);
+}
+
+double _normalizeAngleDeg(double deg) {
+  var d = deg % 360;
+  if (d > 180) d -= 360;
+  if (d < -180) d += 360;
+  return d;
+}
+
+double _angleDiffDeg(double fromDeg, double toDeg) =>
+    _normalizeAngleDeg(toDeg - fromDeg);
+
+/// True when [candidate] steps backward relative to travel prev→anchor.
+bool isBackwardGpsStep(
+  LatLng anchor,
+  LatLng prev,
+  LatLng candidate, {
+  double maxReverseDeg = 95,
+  double minSegM = 0.12,
+}) {
+  final d = _distMeters(anchor, candidate);
+  if (d < minSegM) return true;
+  final travel = _bearingDeg(prev, anchor);
+  final step = _bearingDeg(anchor, candidate);
+  return _angleDiffDeg(travel, step).abs() > maxReverseDeg;
+}
+
+/// Drop short hops and GPS back-flicks that fold the swath corridor.
+List<LatLng> filterForwardGpsPath(
+  List<LatLng> path, {
+  double minSegM = 0.5,
+  double maxReverseDeg = 95,
+}) {
+  if (path.isEmpty) return [];
+  final out = <LatLng>[path.first];
+  for (int i = 1; i < path.length; i++) {
+    final curr = path[i];
+    final prev = out.last;
+    final d = _distMeters(prev, curr);
+    if (d < minSegM) continue;
+    if (out.length >= 2 &&
+        isBackwardGpsStep(
+          prev,
+          out[out.length - 2],
+          curr,
+          maxReverseDeg: maxReverseDeg,
+        )) {
+      continue;
+    }
+    out.add(curr);
+  }
+  return out;
+}
+
+/// Break a path where the tractor backtracks (separate swath ribbons).
+List<List<LatLng>> splitPathAtReversals(
+  List<LatLng> path, {
+  double maxReverseDeg = 95,
+}) {
+  if (path.length < 2) return path.isEmpty ? [] : [List<LatLng>.from(path)];
+
+  final segments = <List<LatLng>>[];
+  var seg = <LatLng>[path.first];
+
+  for (int i = 1; i < path.length; i++) {
+    final curr = path[i];
+    if (seg.length >= 2 &&
+        isBackwardGpsStep(
+          seg.last,
+          seg[seg.length - 2],
+          curr,
+          maxReverseDeg: maxReverseDeg,
+        )) {
+      if (seg.length >= 2) segments.add(List<LatLng>.from(seg));
+      seg = [curr];
+    } else {
+      if (seg.isEmpty || _distMeters(seg.last, curr) >= 0.05) {
+        seg.add(curr);
+      }
+    }
+  }
+  if (seg.length >= 2) segments.add(seg);
+  return segments;
+}
+
+/// Offset [point] behind/right relative to travel [bearingDeg] (metres).
+LatLng offsetFromTravel(
+  LatLng point,
+  double bearingDeg,
+  double behindM,
+  double rightM,
+) {
+  const rm = 111320.0;
+  final rad = bearingDeg * math.pi / 180.0;
+  final fNorth = math.cos(rad);
+  final fEast = math.sin(rad);
+  final northM = -fNorth * behindM - fEast * rightM;
+  final eastM = -fEast * behindM + fNorth * rightM;
+  final cosLat = math.cos(point.latitude * math.pi / 180.0);
+  return LatLng(
+    point.latitude + northM / rm,
+    point.longitude + eastM / (rm * cosLat),
+  );
+}
+
+/// Boom-centre path from GPS fixes using path-tangent travel direction (stable corners).
+List<LatLng> implementCenterPathFromGps(
+  List<LatLng> gpsPath, {
+  required double gpsBehindM,
+  required double gpsLateralM,
+  required double hitchToAxleM,
+  required double boomLateralM,
+}) {
+  if (gpsPath.isEmpty) return [];
+  final behindM = gpsBehindM + hitchToAxleM;
+  final lateralM = gpsLateralM + boomLateralM;
+
+  if (gpsPath.length == 1) {
+    return [gpsPath.first];
+  }
+
+  final out = <LatLng>[];
+  for (int i = 0; i < gpsPath.length; i++) {
+    late double bearing;
+    if (i == 0) {
+      bearing = _bearingDeg(gpsPath[0], gpsPath[1]);
+    } else if (i == gpsPath.length - 1) {
+      bearing = _bearingDeg(gpsPath[i - 1], gpsPath[i]);
+    } else {
+      bearing = _bearingDeg(gpsPath[i - 1], gpsPath[i + 1]);
+    }
+    out.add(offsetFromTravel(gpsPath[i], bearing, behindM, lateralM));
+  }
+  return out;
+}
+
 /// One boom pose: centre point and geographic heading (0 = north).
 class SwathStamp {
   final LatLng center;
   final double headingDeg;
 
   const SwathStamp(this.center, this.headingDeg);
-}
-
-/// Left/right boom tip offset in local EN metres from centre.
-_XY _boomHalfWidthOffset(double headingDeg, double halfWidth) {
-  final hRad = headingDeg * math.pi / 180.0;
-  return _XY(math.cos(hRad) * halfWidth, -math.sin(hRad) * halfWidth);
 }
 
 List<SwathStamp> simplifySwathStamps(
@@ -359,32 +544,25 @@ List<SwathStamp> simplifySwathStamps(
   return out;
 }
 
+/// Total path length (metres) along stamp centres.
+double pathDistanceMFromStamps(List<SwathStamp> stamps) {
+  if (stamps.length < 2) return 0;
+  var total = 0.0;
+  for (int i = 1; i < stamps.length; i++) {
+    total += _distMeters(stamps[i - 1].center, stamps[i].center);
+  }
+  return total;
+}
+
 /// Swath corridor from oriented boom stamps (paint-brush model).
+/// Uses bevel joins along the centre path so sharp corners stay filled.
 List<LatLng> buildSwathRingFromOrientedStamps(
   List<SwathStamp> stamps,
   double widthM,
 ) {
   if (stamps.length < 2) return [];
-
-  final half = (widthM <= 0 ? 3.0 : widthM) * 0.5;
-  final origin = stamps[stamps.length ~/ 2].center;
-  final cosLat = math.cos(origin.latitude * math.pi / 180.0);
-
-  final left = <_XY>[];
-  final right = <_XY>[];
-  for (final s in stamps) {
-    final c = _toLocal(s.center, origin, cosLat);
-    final off = _boomHalfWidthOffset(s.headingDeg, half);
-    left.add(c - off);
-    right.add(c + off);
-  }
-
-  if (left.length < 2) return [];
-
-  return <LatLng>[
-    for (final v in left) _fromLocal(v, origin, cosLat),
-    for (final v in right.reversed) _fromLocal(v, origin, cosLat),
-  ];
+  final path = stamps.map((s) => s.center).toList();
+  return buildSwathRingFromPath(path, widthM);
 }
 
 List<List<SwathStamp>> splitStampsAtJumps(
@@ -496,14 +674,17 @@ List<List<LatLng>> splitPathAtJumps(List<LatLng> path, {double maxJumpM = 40}) {
   return segments;
 }
 
-/// One closed ring per continuous path segment.
+/// One closed ring per continuous forward path segment.
 List<List<LatLng>> buildSwathRingsFromPath(List<LatLng> path, double widthM) {
   final rings = <List<LatLng>>[];
-  for (final seg in splitPathAtJumps(path)) {
-    final simplified = simplifySwathPath(seg);
-    if (simplified.length < 2) continue;
-    final ring = buildSwathRingFromPath(simplified, widthM);
-    if (ring.length >= 3) rings.add(ring);
+  final forward = filterForwardGpsPath(path);
+  for (final jumpSeg in splitPathAtJumps(forward)) {
+    for (final seg in splitPathAtReversals(jumpSeg)) {
+      final simplified = simplifySwathPath(seg);
+      if (simplified.length < 2) continue;
+      final ring = buildSwathRingFromPath(simplified, widthM);
+      if (ring.length >= 3) rings.add(ring);
+    }
   }
   return rings;
 }

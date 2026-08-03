@@ -18,6 +18,7 @@ dependencies:
   share_plus: ^11.1.0
   downloadsfolder: ^1.2.0
   flutter_map_dragmarker: ^6.0.0
+  usb_serial: ^0.5.2
 
 
 dev_dependencies:

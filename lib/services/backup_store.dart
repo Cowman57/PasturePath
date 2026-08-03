@@ -5,6 +5,7 @@ import 'package:downloadsfolder/downloadsfolder.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../models/job.dart';
 import 'job_store.dart';
 
 class BackupInfo {
@@ -44,15 +45,17 @@ class BackupStore {
     'width',
     'offset',
     'gpsSmoothness',
-    'gpsPivotOffset',
     'gpsLateralOffset',
     'hitchToAxle',
     'drawbarLength',
-    'axleToBoom',
     'boomLateralOffset',
-    'implementTrailed',
     'selectedToolPresetName',
     'satellite',
+    'themeMode',
+    'gpsInputMode',
+    'gpsBaudRate',
+    'gpsPreferredVid',
+    'gpsPreferredPid',
   ];
 
   static Future<String> backupsDir() async {
@@ -221,7 +224,10 @@ class BackupStore {
       } else if (v is num) {
         if (key == 'headingDashed' || key == 'satellite') {
           await prefs.setBool(key, v != 0);
-        } else if (key == 'overlayColor' ||
+        } else if (key == 'gpsBaudRate' ||
+            key == 'gpsPreferredVid' ||
+            key == 'gpsPreferredPid' ||
+            key == 'overlayColor' ||
             key == 'guidanceColor' ||
             key == 'headingColor' ||
             key == 'swathColor') {
@@ -256,10 +262,24 @@ class BackupStore {
       final name = entry['fileName']?.toString();
       final jobData = entry['data'];
       if (name == null || name.isEmpty || jobData == null) continue;
-      await io.File('${jobsRoot.path}/$name').writeAsString(
-        jsonEncode(jobData),
+      if (jobData is! Map) continue;
+      final jobPath = '${jobsRoot.path}/$name';
+      final jobMap = Map<String, dynamic>.from(jobData);
+      await io.File(jobPath).writeAsString(
+        jsonEncode(jobMap),
         flush: true,
       );
+      // Sidecar meta so History does not re-parse full paths on first open.
+      try {
+        final job = SavedJob.fromJson(jobMap);
+        final summary = JobFileSummary.fromSavedJob(job, jobPath);
+        await io.File(JobStore.metaPathFor(jobPath)).writeAsString(
+          jsonEncode(summary.toJson()),
+          flush: true,
+        );
+      } catch (_) {
+        // Meta is best-effort; listJobSummaries can still migrate later.
+      }
     }
 
     return BackupInfo(

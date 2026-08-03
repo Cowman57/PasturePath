@@ -1,11 +1,11 @@
 import 'dart:convert';
 import 'dart:io' as io;
 
-import 'package:latlong2/latlong.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:share_plus/share_plus.dart';
 
 import '../models/job.dart';
+import 'job_save_isolate.dart';
 
 class JobStore {
   static Future<String> _dir(String name) async {
@@ -21,16 +21,56 @@ class JobStore {
   static Future<List<String>> listJobFiles() async {
     final root = await jobsDir();
     final items = await io.Directory(root).list(followLinks: false).toList();
-    final files = items.whereType<io.File>().where((f) => f.path.endsWith('.json')).toList();
+    final files = items
+        .whereType<io.File>()
+        .where((f) => f.path.endsWith('.json') && !f.path.endsWith('.meta.json'))
+        .toList();
     files.sort((a, b) => a.path.compareTo(b.path));
     return files.map((f) => f.path).toList();
+  }
+
+  static String metaPathFor(String jobJsonPath) {
+    if (jobJsonPath.endsWith('.json')) {
+      return '${jobJsonPath.substring(0, jobJsonPath.length - 5)}.meta.json';
+    }
+    return '$jobJsonPath.meta.json';
   }
 
   static Future<void> save(SavedJob job) async {
     final dir = await jobsDir();
     final safe = job.id.replaceAll('/', '-');
-    final f = io.File('$dir/$safe.json');
-    await f.writeAsString(jsonEncode(job.toJson()), flush: true);
+    final path = '$dir/$safe.json';
+    final metaPath = metaPathFor(path);
+    final summary = JobFileSummary.fromSavedJob(job, path);
+    // Write on the main isolate — background compute can hang on some Android devices.
+    await writeJobFileStringsIsolate({
+      'jobPath': path,
+      'metaPath': metaPath,
+      'jobJson': jsonEncode(job.toJson()),
+      'metaJson': jsonEncode(summary.toJson()),
+    });
+  }
+
+  static Future<JobFileSummary> readSummary(String filePath) async {
+    final meta = io.File(metaPathFor(filePath));
+    if (await meta.exists()) {
+      final txt = await meta.readAsString();
+      return JobFileSummary.fromJson(filePath, jsonDecode(txt) as Map<String, dynamic>);
+    }
+    final job = await read(filePath);
+    return JobFileSummary.fromSavedJob(job, filePath);
+  }
+
+  static Future<List<JobFileSummary>> listJobSummaries() async {
+    final dir = await jobsDir();
+    final maps = await listJobSummariesIsolate(dir);
+    return [
+      for (final m in maps)
+        JobFileSummary.fromJson(
+          m['filePath'] as String,
+          Map<String, dynamic>.from(m)..remove('filePath'),
+        ),
+    ];
   }
 
   static Future<SavedJob> read(String filePath) async {
@@ -42,6 +82,10 @@ class JobStore {
     final f = io.File(filePath);
     if (await f.exists()) {
       await f.delete();
+    }
+    final meta = io.File(metaPathFor(filePath));
+    if (await meta.exists()) {
+      await meta.delete();
     }
   }
 

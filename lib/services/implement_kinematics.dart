@@ -2,9 +2,7 @@ import 'dart:math' as math;
 
 import 'package:latlong2/latlong.dart';
 
-enum ImplementMount { fixed, trailed }
-
-/// Visual + swath geometry: GPS → hitch → axle → boom centre (inverted T).
+/// Visual + swath geometry: GPS → hitch → axle → boom centre.
 class ImplementGeometry {
   final LatLng gpsPos;
   final LatLng hitchPivot;
@@ -25,73 +23,35 @@ class ImplementGeometry {
   });
 }
 
-/// Computes implement position. Trailed mode uses hitch articulation:
-/// dθ/ds = sin(β) / L  where β = tractorHeading − trailerHeading.
+/// Computes implement position from GPS, heading, and tool dimensions.
 class ImplementTracker {
-  /// Reject per-step yaw spikes from GPS glitches (not a physics limit).
-  static const double maxYawStepDeg = 18.0;
-
   double implementHeadingDeg = 0;
   LatLng? implementCenter;
   LatLng? hitchPivot;
   LatLng? trailerAxle;
-  LatLng? _lastPivotPos;
-  bool _hasHeading = false;
-  double? _lastTractorHeadingDeg;
-
-  bool get hasHeading => _hasHeading;
 
   void reset() {
     implementHeadingDeg = 0;
     implementCenter = null;
     hitchPivot = null;
     trailerAxle = null;
-    _lastPivotPos = null;
-    _hasHeading = false;
-    _lastTractorHeadingDeg = null;
   }
 
-  ImplementGeometry layout({
+  /// Pure geometry — does not mutate tracker state (safe for swath projection).
+  static ImplementGeometry compute({
     required LatLng gpsPos,
-    required double? gpsHeadingDeg,
+    required double headingDeg,
     required double gpsToPivotM,
     required double gpsLateralOffsetM,
     required double hitchToAxleM,
-    required double axleToBoomM,
     required double widthM,
     required double lateralOffsetM,
-    required ImplementMount mount,
-    bool integrateTrailer = true,
   }) {
     final hitchBar = hitchToAxleM.clamp(0.0, 80.0);
-    final boomReach = axleToBoomM.clamp(0.0, 80.0);
     final w = widthM <= 0 ? 3.0 : widthM;
-    if (gpsHeadingDeg != null) _lastTractorHeadingDeg = gpsHeadingDeg;
-    final tractorH =
-        gpsHeadingDeg ?? _lastTractorHeadingDeg ?? implementHeadingDeg;
-    final pivot = _hitchFromGps(gpsPos, tractorH, gpsToPivotM, gpsLateralOffsetM);
-    hitchPivot = pivot;
+    final heading = headingDeg;
 
-    double heading;
-    if (mount == ImplementMount.fixed) {
-      heading = tractorH;
-      implementHeadingDeg = heading;
-      _hasHeading = true;
-      _lastPivotPos = pivot;
-    } else if (integrateTrailer) {
-      heading = _trailedHeading(
-        pivot: pivot,
-        gpsHeadingDeg: gpsHeadingDeg,
-        tractorH: tractorH,
-        hitchBar: hitchBar,
-      );
-    } else {
-      if (!_hasHeading) {
-        implementHeadingDeg = tractorH;
-        _hasHeading = true;
-      }
-      heading = implementHeadingDeg;
-    }
+    final pivot = _hitchFromGps(gpsPos, heading, gpsToPivotM, gpsLateralOffsetM);
 
     final hRad = heading * math.pi / 180.0;
     final behindEast = -math.sin(hRad);
@@ -104,14 +64,8 @@ class ImplementTracker {
       behindEast * hitchBar,
       behindNorth * hitchBar,
     );
-    trailerAxle = axle;
 
-    var center = _offsetMeters(
-      axle,
-      behindEast * boomReach,
-      behindNorth * boomReach,
-    );
-
+    var center = axle;
     if (lateralOffsetM.abs() > 1e-9) {
       center = _offsetMeters(
         center,
@@ -119,8 +73,6 @@ class ImplementTracker {
         rightNorth * lateralOffsetM,
       );
     }
-
-    implementCenter = center;
 
     final perpRad = (heading + 90.0) * math.pi / 180.0;
     final half = w * 0.5;
@@ -140,49 +92,30 @@ class ImplementTracker {
     );
   }
 
-  /// Hitch articulation: trailer yaw rate = sin(β) / L per metre hitch travel.
-  double _trailedHeading({
-    required LatLng pivot,
+  ImplementGeometry layout({
+    required LatLng gpsPos,
     required double? gpsHeadingDeg,
-    required double tractorH,
-    required double hitchBar,
+    required double gpsToPivotM,
+    required double gpsLateralOffsetM,
+    required double hitchToAxleM,
+    required double widthM,
+    required double lateralOffsetM,
   }) {
-    if (!_hasHeading) {
-      implementHeadingDeg = gpsHeadingDeg ?? tractorH;
-      _hasHeading = true;
-      _lastPivotPos = pivot;
-      return implementHeadingDeg;
-    }
-
-    if (_lastPivotPos != null) {
-      final ds = _distM(_lastPivotPos!, pivot);
-      if (ds > 0.04) {
-        final travelBearing = const Distance().bearing(_lastPivotPos!, pivot);
-        final effTractorH = _effectiveTractorHeadingDeg(
-          gpsHeadingDeg ?? tractorH,
-          travelBearing,
-        );
-        final betaRad = _degToRad(
-          _normalizeAngle(effTractorH - implementHeadingDeg),
-        );
-        final bar = hitchBar.clamp(0.5, 80.0);
-        var dThetaDeg = (ds / bar) * math.sin(betaRad) * 180.0 / math.pi;
-        dThetaDeg = dThetaDeg.clamp(-maxYawStepDeg, maxYawStepDeg);
-        implementHeadingDeg = _normalizeAngle(implementHeadingDeg + dThetaDeg);
-      }
-    }
-
-    _lastPivotPos = pivot;
-    return implementHeadingDeg;
-  }
-
-  static double _effectiveTractorHeadingDeg(
-    double tractorHeadingDeg,
-    double travelBearingDeg,
-  ) {
-    final diff = _normalizeAngle(travelBearingDeg - tractorHeadingDeg);
-    if (diff > 90 || diff < -90) return travelBearingDeg;
-    return tractorHeadingDeg;
+    final heading = gpsHeadingDeg ?? implementHeadingDeg;
+    final geom = compute(
+      gpsPos: gpsPos,
+      headingDeg: heading,
+      gpsToPivotM: gpsToPivotM,
+      gpsLateralOffsetM: gpsLateralOffsetM,
+      hitchToAxleM: hitchToAxleM,
+      widthM: widthM,
+      lateralOffsetM: lateralOffsetM,
+    );
+    implementHeadingDeg = heading;
+    hitchPivot = geom.hitchPivot;
+    trailerAxle = geom.trailerAxle;
+    implementCenter = geom.implementCenter;
+    return geom;
   }
 
   /// Hitch behind GPS along heading; [gpsLateralOffsetM] + = GPS right of hitch.
@@ -203,18 +136,6 @@ class ImplementTracker {
       behindNorth * gpsToPivotM - rightNorth * gpsLateralOffsetM,
     );
   }
-
-  static double _normalizeAngle(double deg) {
-    var a = deg % 360;
-    if (a > 180) a -= 360;
-    if (a < -180) a += 360;
-    return a;
-  }
-
-  static double _degToRad(double deg) => deg * math.pi / 180.0;
-
-  static double _distM(LatLng a, LatLng b) =>
-      const Distance().as(LengthUnit.Meter, a, b);
 
   static LatLng _offsetMeters(LatLng p, double eastM, double northM) {
     const rm = 111320.0;

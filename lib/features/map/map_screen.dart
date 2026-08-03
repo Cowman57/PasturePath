@@ -6,22 +6,27 @@ import 'dart:typed_data';
 import 'dart:convert';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
 import 'package:flutter_map_dragmarker/flutter_map_dragmarker.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import '../../app_theme.dart';
 import '../../models/paddock.dart';
 import '../../models/job.dart';
+import '../../models/gps_fix.dart';
 import '../../services/backup_store.dart';
 import '../../services/job_store.dart';
 import '../../services/geometry.dart';
 import '../../services/geojson_parser.dart';
 import '../../services/gps_display_smoother.dart';
+import '../../services/gps/gps_input_controller.dart';
+import '../../services/gps/gps_source.dart';
+import '../../services/gps/usb_serial_gps_source.dart';
 import '../../services/implement_kinematics.dart';
 import '../../models/tool_setup_dimensions.dart';
 import '../../services/tool_preset_store.dart';
@@ -36,7 +41,10 @@ enum EditorTool { none, drawOuter, drawHole, edit }
 enum RotationMode { northUp, travelUp, free }
 
 class MapScreen extends StatefulWidget {
-  const MapScreen({super.key});
+  const MapScreen({super.key, required this.themeController});
+
+  final ThemeController themeController;
+
   @override
   State<MapScreen> createState() => _MapScreenState();
 }
@@ -63,7 +71,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   final ValueNotifier<double?> _dispHeadingNotifier = ValueNotifier(null);
   final ValueNotifier<Polyline?> _lookAheadNotifier = ValueNotifier(null);
 
-  StreamSubscription<Position>? _posSub;
+  final GpsInputController _gpsInput = GpsInputController();
+  StreamSubscription<GpsFix>? _posSub;
 
   // rotation / camera
   RotationMode _rotationMode = RotationMode.northUp;
@@ -88,18 +97,26 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   double get _width => _toolDims.width;
   double get _offset => _toolDims.boomLateralOffset;
-  ImplementMount get _implementMount => _toolDims.mount;
 
   final ImplementTracker _implementTracker = ImplementTracker();
   final ValueNotifier<List<Polyline>> _implementPolysNotifier = ValueNotifier([]);
 
   // paddocks
   List<Paddock> _paddocks = [];
+  final ValueNotifier<List<Polygon>> _paddockPolysNotifier = ValueNotifier([]);
+  final ValueNotifier<List<Marker>> _paddockLabelsNotifier = ValueNotifier([]);
+  bool _paddockLabelsZoomVisible = false;
+  bool _jobFinishInProgress = false;
+  int _historyListGeneration = 0;
+  Future<List<JobFileSummary>>? _jobSummariesFuture;
+  Future<List<BackupInfo>>? _backupsFuture;
 
   // selection
   final Set<int> _selectedIdx = <int>{};
   bool _suppressAutoPaddockSelect = false;
   int? _lastGpsInsidePaddockIdx;
+  int _lastAutoSelectMs = 0;
+  static const int _autoSelectIntervalMs = 500;
 
   // nav
   bool _navMode = false;
@@ -107,8 +124,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   LatLng? _pointB;
   /// Parallel guidance lines — each entry is one swath line (may be clipped to segments).
   List<List<List<LatLng>>> _guidanceParallelLines = [];
-  List<Polyline> _navLines = [];
   int _activeLineIndex = 0; // index into [_guidanceParallelLines]
+  static const double _guidanceSafetyFactor = 2.0;
+  static const double _guidanceMaxSpanCapM = 500.0;
+  static const double _guidanceAlongTrackMargin = 1.5;
+  static const int _navLogicIntervalMs = 200;
+  static const double _cameraMoveThresholdM = 1.5;
+  static const double _cameraRotateThresholdDeg = 1.0;
+  static const int _guidanceScanRadius = 3;
+  int _lastNavLogicMs = 0;
+  LatLng? _lastCameraTarget;
+  double? _lastCameraRotationDeg;
 
   // look-ahead line (nav mode)
 
@@ -117,15 +143,33 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   // recording path & swath
   DateTime? _jobStartTime;
-  List<LatLng> _jobPath = [];
-  List<SwathStamp> _jobStamps = [];
-  double _jobDistanceM = 0.0;
+  List<LatLng> _gpsRecordPath = [];
+  List<LatLng> _jobPath = []; // boom-centre path derived from GPS
+  double? _lastTravelBearingDeg;
+  double _speedDistanceM = 0.0; // ∫ GPS speed dt (metres)
+  DateTime? _lastSpeedFixTime;
   double _appliedDistanceM = 0.0;
   double _currentSpeedKph = 0.0;
-  final List<Polygon> _swathPolys = [];
-  Polyline? _navPathPolyline;
-  int _swathRebuildCounter = 0;
-  static const int _swathRebuildEveryN = 4;
+  final List<Polygon> _committedSwathPolys = [];
+  final ValueNotifier<List<Polygon>> _swathCommittedNotifier = ValueNotifier([]);
+  final ValueNotifier<Polygon?> _swathLiveNotifier = ValueNotifier(null);
+  final ValueNotifier<Polyline?> _navPathCommittedNotifier = ValueNotifier(null);
+  final ValueNotifier<Polyline?> _navPathTailNotifier = ValueNotifier(null);
+  final ValueNotifier<List<Polyline>> _navLinesNotifier = ValueNotifier([]);
+  final ValueNotifier<double> _signedErrorNotifier = ValueNotifier(0.0);
+  final ValueNotifier<int> _navHudTickNotifier = ValueNotifier(0);
+  /// Boom points already polygonised into [_committedSwathPolys].
+  int _swathCommittedBoomLen = 0;
+  int _lastSwathCommitMs = 0;
+  static const double _minGpsRecordM = 1.0;
+  static const double _maxGpsJumpM = 35.0;
+  static const double _minMovingSpeedMps = 0.4;
+  /// Stronger simplify on save keeps job files smaller for history / map show.
+  static const double _jobSaveSimplifyMinDistM = 1.25;
+  static const int _swathDisplaySimplifyAfter = 80;
+  static const double _swathDisplaySimplifyMinDistM = 0.85;
+  static const int _swathCommitIntervalMs = 200; // ~5 Hz max
+  static const double _swathCommitMinAdvanceM = 4.0;
   // ====== Paddock Editor ======
   EditorTool _tool = EditorTool.none;
 
@@ -162,8 +206,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   final Set<String> _histSelected = <String>{};
   final Set<DateTime> _histExpandedDays = <DateTime>{};
 
-  // Error HUD / chevrons
-  double _signedErrorM = 0.0; // +ve steer right, -ve steer left
+  // Error HUD / chevrons (+ve steer right, -ve steer left via [_signedErrorNotifier])
   late final AnimationController _chevCtrl;
   late final TabController _drawerTabCtrl;
   static const int _chevrons = 4; // avoids overflow; auto-sizes
@@ -197,11 +240,21 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   @override
   void dispose() {
     _posSub?.cancel();
+    _gpsInput.dispose();
     _gpsSmoothTicker?.dispose();
     _dispPosNotifier.dispose();
     _dispHeadingNotifier.dispose();
     _lookAheadNotifier.dispose();
     _implementPolysNotifier.dispose();
+    _swathCommittedNotifier.dispose();
+    _swathLiveNotifier.dispose();
+    _navPathCommittedNotifier.dispose();
+    _navPathTailNotifier.dispose();
+    _navLinesNotifier.dispose();
+    _signedErrorNotifier.dispose();
+    _navHudTickNotifier.dispose();
+    _paddockPolysNotifier.dispose();
+    _paddockLabelsNotifier.dispose();
     _chevCtrl.dispose();
     _drawerTabCtrl.dispose();
     super.dispose();
@@ -210,18 +263,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   // ---------- Prefs ----------
   Future<void> _loadPrefs() async {
     final p = await SharedPreferences.getInstance();
+    final gpsMode = GpsInputModeX.fromPrefs(p.getString('gpsInputMode'));
+    final gpsBaud = p.getInt('gpsBaudRate') ?? GpsInputController.defaultBaudRate;
     setState(() {
       _units = p.getString('units') ?? 'meters';
       _toolDims = ToolSetupDimensions(
         width: p.getDouble('width') ?? 3.0,
         boomLateralOffset: p.getDouble('boomLateralOffset') ?? p.getDouble('offset') ?? 0.0,
-        gpsPivotOffset: p.getDouble('gpsPivotOffset') ?? 2.0,
         gpsLateralOffset: p.getDouble('gpsLateralOffset') ?? 0.0,
         hitchToAxle: p.getDouble('hitchToAxle') ?? p.getDouble('drawbarLength') ?? 3.0,
-        axleToBoom: p.getDouble('axleToBoom') ?? 0.0,
-        mount: p.getBool('implementTrailed') == true
-            ? ImplementMount.trailed
-            : ImplementMount.fixed,
       );
       _satellite = p.getBool('satellite') ?? false;
       _gpsSmoothness = p.getDouble('gpsSmoothness') ?? 0.0;
@@ -233,6 +283,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _selectedToolPresetName =
           (presetName != null && presetName.isNotEmpty) ? presetName : null;
     });
+    await _gpsInput.setBaudRate(gpsBaud);
+    await _gpsInput.setMode(gpsMode);
+    final prefVid = p.getInt('gpsPreferredVid');
+    final prefPid = p.getInt('gpsPreferredPid');
+    if (prefVid != null && prefPid != null) {
+      _gpsInput.restorePreferredVidPid(prefVid, prefPid);
+    }
   }
 
   Future<void> _writePrefsToDisk() async {
@@ -241,14 +298,23 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     await p.setDouble('width', _toolDims.width);
     await p.setDouble('offset', _toolDims.boomLateralOffset);
     await p.setDouble('boomLateralOffset', _toolDims.boomLateralOffset);
-    await p.setDouble('gpsPivotOffset', _toolDims.gpsPivotOffset);
     await p.setDouble('gpsLateralOffset', _toolDims.gpsLateralOffset);
     await p.setDouble('hitchToAxle', _toolDims.hitchToAxle);
     await p.setDouble('drawbarLength', _toolDims.hitchToAxle);
-    await p.setDouble('axleToBoom', _toolDims.axleToBoom);
-    await p.setBool('implementTrailed', _toolDims.mount == ImplementMount.trailed);
     await p.setBool('satellite', _satellite);
+    await p.setString(ThemeController.prefsKey, ThemeController.toPrefs(widget.themeController.mode));
     await p.setDouble('gpsSmoothness', _gpsSmoothness);
+    await p.setString('gpsInputMode', _gpsInput.mode.prefsValue);
+    await p.setInt('gpsBaudRate', _gpsInput.baudRate);
+    final prefVid = _gpsInput.preferredVid;
+    final prefPid = _gpsInput.preferredPid;
+    if (prefVid != null && prefPid != null) {
+      await p.setInt('gpsPreferredVid', prefVid);
+      await p.setInt('gpsPreferredPid', prefPid);
+    } else {
+      await p.remove('gpsPreferredVid');
+      await p.remove('gpsPreferredPid');
+    }
     if (_selectedToolPresetName != null && _selectedToolPresetName!.isNotEmpty) {
       await p.setString('selectedToolPresetName', _selectedToolPresetName!);
     } else {
@@ -261,14 +327,16 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     'width': _toolDims.width,
     'offset': _toolDims.boomLateralOffset,
     'boomLateralOffset': _toolDims.boomLateralOffset,
-    'gpsPivotOffset': _toolDims.gpsPivotOffset,
     'gpsLateralOffset': _toolDims.gpsLateralOffset,
     'hitchToAxle': _toolDims.hitchToAxle,
     'drawbarLength': _toolDims.hitchToAxle,
-    'axleToBoom': _toolDims.axleToBoom,
-    'implementTrailed': _toolDims.mount == ImplementMount.trailed,
     'satellite': _satellite,
+    ThemeController.prefsKey: ThemeController.toPrefs(widget.themeController.mode),
     'gpsSmoothness': _gpsSmoothness,
+    'gpsInputMode': _gpsInput.mode.prefsValue,
+    'gpsBaudRate': _gpsInput.baudRate,
+    if (_gpsInput.preferredVid != null) 'gpsPreferredVid': _gpsInput.preferredVid,
+    if (_gpsInput.preferredPid != null) 'gpsPreferredPid': _gpsInput.preferredPid,
     if (_selectedToolPresetName != null) 'selectedToolPresetName': _selectedToolPresetName,
   };
 
@@ -296,6 +364,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         settings: _currentSettingsMap(),
         farmJsonText: await _farmJsonTextForBackup(),
       );
+      _invalidateBackupsFuture();
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(result.userMessage)),
@@ -385,6 +454,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   Future<void> _applyRestoredData() async {
     await _loadPrefs();
+    await widget.themeController.load();
+    _invalidateBackupsFuture();
     setState(() {
       _paddocks = [];
       _persistedJsonPath = null;
@@ -395,17 +466,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _historySwathPolys.clear();
       _historyPathPolylines.clear();
       _selectedIdx.clear();
-      _navLines = [];
+      _navLinesNotifier.value = [];
       _guidanceParallelLines = [];
       _pointA = null;
       _pointB = null;
       _lookAheadNotifier.value = null;
-      _swathPolys.clear();
-      _navPathPolyline = null;
+      _clearSwathDisplay();
       _histSelecting = false;
       _histSelected.clear();
       _suppressAutoPaddockSelect = false;
     });
+    _rebuildPaddockLayers();
     await _loadPersistedFarmJsonIfAny();
     _resetToMapDefaults();
   }
@@ -474,6 +545,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _persistedJsonPath = path;
         _maybeAutoSelectPaddockFromGps();
       });
+      _rebuildPaddockLayers();
       if (_paddocks.isNotEmpty && _mapReady) {
         _mapController.move(_paddocks.first.labelPoint, 16);
       }
@@ -482,80 +554,39 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   // ---------- Location ----------
   Future<void> _ensureLocationFlow() async {
-    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled && mounted) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Please enable Location Services')),
-      );
-    }
-
-    var permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
-    }
-    if (permission == LocationPermission.denied || permission == LocationPermission.deniedForever) {
-      if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Location permission required')),
-      );
-      return;
-    }
-
-    try {
-      final pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.bestForNavigation,
-        timeLimit: const Duration(seconds: 10),
-      );
-      if (mounted) {
-        _applyGpsFix(pos, snapDisplay: true);
-        setState(() {});
-      }
-    } catch (_) {}
-
     _posSub?.cancel();
-    final LocationSettings settings;
-    if (io.Platform.isAndroid) {
-      settings = AndroidSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 0,
-        intervalDuration: const Duration(milliseconds: 100),
-        forceLocationManager: true,
-      );
-    } else if (io.Platform.isIOS) {
-      settings = AppleSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 0,
-        allowBackgroundLocationUpdates: false,
-        pauseLocationUpdatesAutomatically: false,
-        activityType: ActivityType.otherNavigation,
-      );
-    } else {
-      settings = const LocationSettings(
-        accuracy: LocationAccuracy.bestForNavigation,
-        distanceFilter: 0,
+    _posSub = _gpsInput.fixes.listen((fix) {
+      if (!mounted) return;
+      _applyGpsFix(fix);
+      _maybeDismissCompletedSummaryOnGpsLeave();
+      // Pose updates go through notifiers — do not setState the whole map screen.
+    });
+    await _gpsInput.start();
+    if (mounted && _gpsInput.lastError != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(_gpsInput.lastError!)),
       );
     }
-
-    _posSub = Geolocator.getPositionStream(locationSettings: settings).listen((p) {
-      if (!mounted) return;
-      _applyGpsFix(p);
-      _updateLookAhead();
-      _updateActiveGuidanceLine();
-      _maybeAutoSelectPaddockFromGps();
-      _maybeDismissCompletedSummaryOnGpsLeave();
-      if (mounted && (_navMode || _gpsSmoothness <= 0)) setState(() {});
-    });
   }
 
-  void _applyGpsFix(Position p, {bool snapDisplay = false}) {
+  void _applyGpsFix(GpsFix p, {bool snapDisplay = false}) {
+    final prevPos = _currentPos;
     final newPos = LatLng(p.latitude, p.longitude);
-    final newHeading = p.heading >= 0 ? p.heading : _currentHeadingDeg;
+    double? newHeading = p.headingDeg ?? _currentHeadingDeg;
+    if (newHeading == null && prevPos != null) {
+      final d = const Distance().as(LengthUnit.Meter, prevPos, newPos);
+      if (d >= 0.4) {
+        newHeading = const Distance().bearing(prevPos, newPos);
+      }
+    }
 
     _currentPos = newPos;
     _currentHeadingDeg = newHeading;
-    if (p.speed >= 0) {
-      _currentSpeedKph = p.speed * 3.6;
+    if (p.hasSpeed) {
+      _currentSpeedKph = p.speedMps! * 3.6;
     }
+    _accumulateSpeedDistance(p);
+    _lastSpeedFixTime = p.timestamp;
 
     _gpsSmoother.smoothness = _gpsSmoothness;
     _gpsSmoother.onFix(
@@ -564,16 +595,34 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       snapDisplay: snapDisplay || _gpsSmoothness <= 0,
     );
     _syncDisplayFromSmoother();
-    _updateImplementGeometry(integrateTrailer: true);
-    _maybeRecordImplementPoint();
+    _updateImplementGeometry();
+    _maybeRecordSwathFromGps(p);
+    if (_navMode) {
+      _syncLiveSwathTip();
+      _syncNavPathTail();
+      _updateLookAhead();
+      _runNavLogicIfDue(force: true);
+    }
+    _maybeAutoSelectPaddockFromGps();
     _applyDisplayCamera();
     _notifyDisplayPosition();
+    if (_navMode) _navHudTickNotifier.value++;
 
     if (_gpsSmoothness > 0) {
       _ensureGpsSmoothTickerRunning();
-    } else if (mounted) {
-      setState(() {});
     }
+  }
+
+  bool _shouldRunNavLogic() {
+    final ms = DateTime.now().millisecondsSinceEpoch;
+    if (ms - _lastNavLogicMs < _navLogicIntervalMs) return false;
+    _lastNavLogicMs = ms;
+    return true;
+  }
+
+  void _runNavLogicIfDue({bool force = false}) {
+    if (!force && !_shouldRunNavLogic()) return;
+    _updateActiveGuidanceLine();
   }
 
   void _ensureGpsSmoothTickerRunning() {
@@ -595,16 +644,18 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (!mounted || _gpsSmoothness <= 0) return;
 
     _gpsSmoother.smoothness = _gpsSmoothness;
-    final animating = _gpsSmoother.tick(DateTime.now());
-    if (!animating) return;
+    _gpsSmoother.tick(DateTime.now());
 
     _syncDisplayFromSmoother();
-    _updateImplementGeometry(integrateTrailer: false);
-    _maybeRecordImplementPoint();
+    _updateImplementGeometry();
+    // Do not rebuild full swath here — that caused lag after long jobs.
     if (_navMode) {
+      _syncLiveSwathTip();
+      _syncNavPathTail();
       _updateLookAhead();
-      _updateActiveGuidanceLine();
+      _runNavLogicIfDue();
     }
+    _maybeAutoSelectPaddockFromGps();
     _applyDisplayCamera();
     _notifyDisplayPosition();
   }
@@ -613,19 +664,39 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (!_mapReady || _dispPos == null) return;
     switch (_rotationMode) {
       case RotationMode.northUp:
-        if (_mapController.camera.rotation.abs() > 0.01) _applyMapRotation(0);
+        final rot = _mapController.camera.rotation;
+        if (rot.abs() > 0.01) {
+          final last = _lastCameraRotationDeg;
+          if (last == null || last.abs() > 0.01) {
+            _applyMapRotation(0);
+            _lastCameraRotationDeg = 0;
+          }
+        }
         break;
       case RotationMode.travelUp:
         final hdg = _tractorHeadingDeg();
         if (hdg != null) {
-          _applyMapRotation(-hdg);
+          final target = -hdg;
+          final last = _lastCameraRotationDeg;
+          if (last == null ||
+              (target - last).abs() >= _cameraRotateThresholdDeg) {
+            _applyMapRotation(target);
+            _lastCameraRotationDeg = target;
+          }
         }
         break;
       case RotationMode.free:
         break;
     }
     if (_followGps && !_showingHistory) {
-      _mapController.move(_dispPos!, _mapController.camera.zoom);
+      final last = _lastCameraTarget;
+      final needMove = last == null ||
+          const Distance().as(LengthUnit.Meter, last, _dispPos!) >=
+              _cameraMoveThresholdM;
+      if (needMove) {
+        _mapController.move(_dispPos!, _mapController.camera.zoom);
+        _lastCameraTarget = _dispPos;
+      }
     }
   }
 
@@ -646,6 +717,158 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   void _openToolSetupDrawer() {
     _drawerTabCtrl.index = 1;
     _scaffoldKey.currentState?.openEndDrawer();
+  }
+
+  void _openGpsSettingsDrawer() {
+    _drawerTabCtrl.index = 2;
+    _scaffoldKey.currentState?.openEndDrawer();
+  }
+
+  String _gpsRailLabel() {
+    switch (_gpsInput.activeSource) {
+      case GpsActiveSource.usb:
+        return 'USB · ${_gpsInput.baudRate}';
+      case GpsActiveSource.device:
+        return 'Device';
+      case GpsActiveSource.none:
+        return switch (_gpsInput.mode) {
+          GpsInputMode.usb => 'USB',
+          GpsInputMode.device => 'Device',
+          GpsInputMode.auto => 'Auto',
+        };
+    }
+  }
+
+  IconData _gpsRailIcon() {
+    switch (_gpsInput.activeSource) {
+      case GpsActiveSource.usb:
+        return Icons.usb;
+      case GpsActiveSource.device:
+        return Icons.smartphone;
+      case GpsActiveSource.none:
+        return Icons.gps_off;
+    }
+  }
+
+  // Shared floating-circle look for rail chips, Start/A/B, finish, rotate, follow.
+  static const double _fabDiameter = 72.0;
+  static const double _fabSecondaryDiameter = 56.0;
+  static const double _fabElevation = 6;
+  /// Margin from screen safe edges to floating controls.
+  static const double _fabEdge = 12.0;
+  /// Gap between floating controls in a stack/rail.
+  static const double _fabGap = 12.0;
+
+  Color get _fabFill {
+    final scheme = Theme.of(context).colorScheme;
+    return scheme.surface.withOpacity(0.94);
+  }
+  Color get _fabContent => Theme.of(context).colorScheme.primary;
+
+  Widget _floatingCircleFace({
+    required double diameter,
+    required Widget child,
+    VoidCallback? onTap,
+  }) {
+    return Material(
+      elevation: _fabElevation,
+      color: _fabFill,
+      shape: const CircleBorder(),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: onTap,
+        customBorder: const CircleBorder(),
+        child: SizedBox(
+          width: diameter,
+          height: diameter,
+          child: Center(child: child),
+        ),
+      ),
+    );
+  }
+
+  /// Circular rail button with icon + label inside the circle.
+  Widget _jobRailChip({
+    required IconData icon,
+    required String label,
+    VoidCallback? onTap,
+  }) {
+    return _floatingCircleFace(
+      diameter: _fabDiameter,
+      onTap: onTap,
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+        child: Column(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: [
+            Icon(icon, size: 22, color: _fabContent),
+            const SizedBox(height: 4),
+            Text(
+              label,
+              textAlign: TextAlign.center,
+              maxLines: 2,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(
+                fontSize: 10,
+                fontWeight: FontWeight.w800,
+                height: 1.1,
+                color: _fabContent,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _jobSideRail({
+    required String paddockLabel,
+    required String toolLabel,
+    required String areaLabel,
+    required String? historyPaddockName,
+  }) {
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.center,
+      children: [
+        _jobRailChip(
+          icon: Icons.grass,
+          label: paddockLabel,
+          onTap: () => setState(() {
+            _selectedIdx.clear();
+            _suppressAutoPaddockSelect = true;
+          }),
+        ),
+        const SizedBox(height: _fabGap),
+        _jobRailChip(
+          icon: Icons.agriculture,
+          label: toolLabel,
+          onTap: _openToolSetupDrawer,
+        ),
+        const SizedBox(height: _fabGap),
+        _jobRailChip(
+          icon: Icons.square_foot,
+          label: areaLabel,
+        ),
+        if (historyPaddockName != null) ...[
+          const SizedBox(height: _fabGap),
+          _jobRailChip(
+            icon: Icons.history,
+            label: 'History',
+            onTap: () => _showPaddockHistory(historyPaddockName),
+          ),
+        ],
+        const SizedBox(height: _fabGap),
+        ListenableBuilder(
+          listenable: _gpsInput,
+          builder: (context, _) => _jobRailChip(
+            icon: _gpsRailIcon(),
+            label: _gpsRailLabel(),
+            onTap: _openGpsSettingsDrawer,
+          ),
+        ),
+      ],
+    );
   }
 
   double _jobSwathWidthM(SavedJob job) => job.resolveSwathWidthM(_currentSwathWidthM());
@@ -674,23 +897,24 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (_jobStartTime == null) return 0;
     final hrs = DateTime.now().difference(_jobStartTime!).inMilliseconds / 3600000.0;
     if (hrs <= 0) return 0;
-    return (_jobDistanceM / 1000.0) / hrs;
+    return (_speedDistanceM / 1000.0) / hrs;
   }
 
   Widget _navDashboard() {
+    final topPad = MediaQuery.of(context).padding.top;
     Widget stat(String label, String value) {
       return Expanded(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
-            Text(label, style: const TextStyle(fontSize: 10, color: Colors.white70)),
-            const SizedBox(height: 2),
+            Text(label, style: const TextStyle(fontSize: 12, color: Colors.white70)),
+            const SizedBox(height: 3),
             Text(
               value,
               textAlign: TextAlign.center,
               style: const TextStyle(
                 fontWeight: FontWeight.w700,
-                fontSize: 13,
+                fontSize: 16,
                 color: Colors.white,
               ),
             ),
@@ -703,13 +927,72 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       elevation: 4,
       color: Colors.black.withOpacity(0.78),
       child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+        padding: EdgeInsets.fromLTRB(10, topPad + 8, 10, 10),
         child: Row(
           children: [
             stat('Speed', '${_currentSpeedKph.toStringAsFixed(1)} km/h'),
             stat('Covered', _areaText(_navLiveAppliedAreaHa())),
             stat('Coverage', '${_navLiveCoveragePercent().toStringAsFixed(0)}%'),
             stat('Avg speed', '${_navLiveAvgSpeedKph().toStringAsFixed(1)} km/h'),
+          ],
+        ),
+      ),
+    );
+  }
+
+  /// Round nav action (Start / A / B / map controls).
+  /// Expanded hit zone does not affect layout, so edge/gap spacing stays visual.
+  Widget _fatRoundActionButton({
+    required VoidCallback onPressed,
+    String? letter,
+    IconData? icon,
+    String? heroTag,
+    double diameter = _fabDiameter,
+    bool expandHit = true,
+  }) {
+    assert(letter != null || icon != null);
+    final hitExtend = expandHit ? diameter / 2 : 0.0;
+    final face = _floatingCircleFace(
+      diameter: diameter,
+      child: letter != null
+          ? Text(
+              letter,
+              style: TextStyle(
+                fontSize: diameter * 0.39,
+                fontWeight: FontWeight.w800,
+                color: _fabContent,
+              ),
+            )
+          : Icon(icon, size: diameter * 0.47, color: _fabContent),
+    );
+    final wrapped = heroTag == null
+        ? face
+        : Hero(
+            tag: heroTag,
+            child: Material(color: Colors.transparent, child: face),
+          );
+    return MediaQuery(
+      data: MediaQuery.of(context).copyWith(
+        gestureSettings: const DeviceGestureSettings(touchSlop: 36),
+      ),
+      child: SizedBox(
+        width: diameter,
+        height: diameter,
+        child: Stack(
+          clipBehavior: Clip.none,
+          alignment: Alignment.center,
+          children: [
+            wrapped,
+            Positioned(
+              left: -hitExtend,
+              top: -hitExtend,
+              right: -hitExtend,
+              bottom: -hitExtend,
+              child: GestureDetector(
+                behavior: HitTestBehavior.translucent,
+                onTap: onPressed,
+              ),
+            ),
           ],
         ),
       ),
@@ -727,10 +1010,82 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         'Higher = smoother but more lag.';
   }
 
-  double _gpsToPivotM() => _toMeters(_toolDims.gpsPivotOffset);
+  double _gpsToPivotM() => _toMeters(ToolSetupDimensions.kGpsPivotOffset);
   double _gpsLateralM() => _toMeters(_toolDims.gpsLateralOffset);
   double _hitchToAxleM() => _toMeters(_toolDims.hitchToAxle);
-  double _axleToBoomM() => _toMeters(_toolDims.axleToBoom);
+
+  void _rebuildJobPathFromGps() {
+    final forward = filterForwardGpsPath(_gpsRecordPath);
+    _jobPath = implementCenterPathFromGps(
+      forward,
+      gpsBehindM: _gpsToPivotM(),
+      gpsLateralM: _gpsLateralM(),
+      hitchToAxleM: _hitchToAxleM(),
+      boomLateralM: _toMeters(_offset),
+    );
+  }
+
+  /// Drop micro zig-zag boom hops that inflate applied metres (mirrors simplify).
+  bool _isSharpZigZagBoomStep(double boomSegM) {
+    if (_jobPath.length < 3 || boomSegM >= 3.0) return false;
+    final a = _jobPath[_jobPath.length - 3];
+    final b = _jobPath[_jobPath.length - 2];
+    final c = _jobPath.last;
+    final bearingIn = const Distance().bearing(a, b);
+    final bearingOut = const Distance().bearing(b, c);
+    var turn = bearingOut - bearingIn;
+    while (turn > 180) {
+      turn -= 360;
+    }
+    while (turn < -180) {
+      turn += 360;
+    }
+    return turn.abs() > 28;
+  }
+
+  double? _pathTravelBearingDeg() {
+    if (_gpsRecordPath.length >= 2) {
+      final a = _gpsRecordPath[_gpsRecordPath.length - 2];
+      final b = _gpsRecordPath.last;
+      return const Distance().bearing(a, b);
+    }
+    return _lastTravelBearingDeg;
+  }
+
+  LatLng? _liveGpsForSwathTip() {
+    final live = _currentPos ?? _dispPos;
+    if (live == null) return null;
+    if (_gpsRecordPath.isEmpty) return live;
+    final anchor = _gpsRecordPath.last;
+    if (_gpsRecordPath.length < 2) return live;
+    final prev = _gpsRecordPath[_gpsRecordPath.length - 2];
+    if (isBackwardGpsStep(anchor, prev, live)) return null;
+    return live;
+  }
+
+  ImplementGeometry _implementGeometryAt(
+    LatLng gps, {
+    required double bearingDeg,
+  }) {
+    return ImplementTracker.compute(
+      gpsPos: gps,
+      headingDeg: bearingDeg,
+      gpsToPivotM: _gpsToPivotM(),
+      gpsLateralOffsetM: _gpsLateralM(),
+      hitchToAxleM: _hitchToAxleM(),
+      widthM: _currentSwathWidthM(),
+      lateralOffsetM: _toMeters(_offset),
+    );
+  }
+
+  void _accumulateSpeedDistance(GpsFix p) {
+    if (!_navMode || _lastSpeedFixTime == null || !p.hasSpeed) return;
+    final dt =
+        p.timestamp.difference(_lastSpeedFixTime!).inMilliseconds / 1000.0;
+    if (dt > 0 && dt < 20) {
+      _speedDistanceM += p.speedMps! * dt;
+    }
+  }
 
   List<Polyline> _buildImplementPolylines(ImplementGeometry g) {
     return [
@@ -759,33 +1114,29 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     ];
   }
 
+  /// Heading for boom overlay — matches the blue look-ahead line.
+  double _boomDisplayHeadingDeg() =>
+      _tractorHeadingDeg() ?? _pathTravelBearingDeg() ?? 0.0;
+
   ImplementGeometry? _updateImplementGeometry({
     LatLng? gpsPos,
     double? gpsHeading,
-    bool integrateTrailer = true,
   }) {
-    final pos = gpsPos ?? _dispPos;
+    final pos = gpsPos ?? _dispPos ?? _currentPos;
     if (pos == null) {
       _implementPolysNotifier.value = [];
       return null;
     }
 
-    final heading = gpsHeading ?? _dispHeadingDeg ?? _currentHeadingDeg;
-    final hitchToAxleM = _hitchToAxleM();
-    final gpsToPivotM = _gpsToPivotM();
+    final double heading = _navMode
+        ? _boomDisplayHeadingDeg()
+        : (gpsHeading ?? _dispHeadingDeg ?? _currentHeadingDeg ?? 0.0);
 
-    final geom = _implementTracker.layout(
-      gpsPos: pos,
-      gpsHeadingDeg: heading,
-      gpsToPivotM: gpsToPivotM,
-      gpsLateralOffsetM: _gpsLateralM(),
-      hitchToAxleM: hitchToAxleM,
-      axleToBoomM: _axleToBoomM(),
-      widthM: _currentSwathWidthM(),
-      lateralOffsetM: _toMeters(_offset),
-      mount: _implementMount,
-      integrateTrailer: integrateTrailer,
-    );
+    final geom = _implementGeometryAt(pos, bearingDeg: heading);
+    _implementTracker.implementHeadingDeg = heading;
+    _implementTracker.hitchPivot = geom.hitchPivot;
+    _implementTracker.trailerAxle = geom.trailerAxle;
+    _implementTracker.implementCenter = geom.implementCenter;
     _implementPolysNotifier.value = _buildImplementPolylines(geom);
     return geom;
   }
@@ -824,13 +1175,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   void _onMapPositionChanged(MapPosition position, bool hasGesture) {
+    _maybeRefreshPaddockLayersForZoom();
     if (!hasGesture || _showingHistory) return;
-
-    if (_followGps && _dispPos != null && position.center != null) {
-      final d = const Distance().as(LengthUnit.Meter, position.center!, _dispPos!);
-      if (d > 25) {
-        setState(() => _followGps = false);
-      }
+    // Stop follow immediately so controller moves don't fight the pan gesture.
+    if (_followGps) {
+      setState(() => _followGps = false);
     }
   }
 
@@ -851,10 +1200,24 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   bool get _showFollowGpsButton =>
       _dispPos != null && !_followGps && !_showingHistory && _mapReady;
 
+  void _resetCameraThrottle() {
+    _lastCameraTarget = null;
+    _lastCameraRotationDeg = null;
+  }
+
+  /// flutter_map: avoid move/rotate in the same frame as onMapReady.
+  void _runAfterMapFrame(VoidCallback fn) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted && _mapReady) fn();
+    });
+  }
+
   void _recenter() {
     if (_dispPos != null && _mapReady) {
       setState(() => _followGps = true);
+      _resetCameraThrottle();
       _mapController.move(_dispPos!, _mapController.camera.zoom);
+      _lastCameraTarget = _dispPos;
     }
   }
 
@@ -866,6 +1229,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         case RotationMode.free: _rotationMode = RotationMode.northUp; break;
       }
     });
+    _resetCameraThrottle();
     if (_mapReady) {
       if (_rotationMode == RotationMode.northUp) _applyMapRotation(0);
       if (_rotationMode == RotationMode.travelUp) {
@@ -900,32 +1264,192 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   // ---------- Label helpers ----------
-  LatLng _safeLabelPoint(Paddock pd) => bestInteriorLabelPoint(pd.outer, pd.holes);
+  void _rebuildPaddockLayers() {
+    if (!mounted) return;
+    final polys = <Polygon>[];
+    final labels = <Marker>[];
+    final zoom = _mapReady ? _mapController.camera.zoom : 0.0;
+    final showLabels = zoom >= 15.0;
+    _paddockLabelsZoomVisible = showLabels;
 
-  // ---------- Swath builder ----------
-  List<Polygon> _swathPolygonsFromStamps(List<SwathStamp> stamps, double widthM) {
-    final c = _swathColor;
-    final o = _swathOpacity;
-    return buildSwathRingsFromOrientedStamps(stamps, widthM).map((ring) => Polygon(
-      points: ring,
-      color: c.withOpacity(o),
-      borderColor: Colors.transparent,
-      borderStrokeWidth: 0,
-      isFilled: true,
-    )).toList();
+    for (int i = 0; i < _paddocks.length; i++) {
+      final pd = _paddocks[i];
+      final isSel = _selectedIdx.contains(i);
+      polys.add(
+        Polygon(
+          points: pd.outer,
+          holePointsList: pd.holes,
+          color: _overlayColor.withOpacity(
+            (_overlayOpacity + (isSel ? 0.08 : 0.0)).clamp(0.0, 1.0),
+          ),
+          borderColor: isSel ? Colors.yellow.shade700 : _overlayColor,
+          borderStrokeWidth: isSel ? 3.5 : 2.0,
+          isFilled: true,
+        ),
+      );
+      if (showLabels) {
+        final labelAnchor = pd.labelPoint;
+        labels.add(
+          Marker(
+            point: labelAnchor,
+            width: 200,
+            height: 52,
+            alignment: Alignment.center,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Text(
+                  pd.name,
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 14,
+                    color: Colors.black87,
+                  ),
+                ),
+                Text(
+                  _areaText(pd.areaHa),
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontStyle: FontStyle.italic,
+                    fontSize: 11,
+                    color: Colors.black54,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+      }
+    }
+
+    _paddockPolysNotifier.value = polys;
+    _paddockLabelsNotifier.value = labels;
   }
 
-  List<Polygon> _swathPolygonsForJob(SavedJob job) {
-    final widthM = _jobSwathWidthM(job);
-    final headings = job.pathHeadingsDeg;
-    if (headings != null && headings.length == job.path.length) {
-      final stamps = <SwathStamp>[
-        for (int i = 0; i < job.path.length; i++)
-          SwathStamp(job.path[i], headings[i]),
-      ];
-      return _swathPolygonsFromStamps(stamps, widthM);
+  void _maybeRefreshPaddockLayersForZoom() {
+    if (!_mapReady) return;
+    final showLabels = _mapController.camera.zoom >= 15.0;
+    if (showLabels != _paddockLabelsZoomVisible) {
+      _rebuildPaddockLayers();
     }
-    return _swathPolygonsFromPath(job.path, widthM);
+  }
+
+  void _closeEndDrawer() {
+    _scaffoldKey.currentState?.closeEndDrawer();
+  }
+
+  /// Handle Android/iOS system back. Returns true if the event was consumed.
+  Future<bool> _handleSystemBack() async {
+    final scaffold = _scaffoldKey.currentState;
+    if (scaffold?.isEndDrawerOpen == true) {
+      scaffold!.closeEndDrawer();
+      if (_histSelecting) {
+        setState(() {
+          _histSelecting = false;
+          _histSelected.clear();
+        });
+      }
+      return true;
+    }
+
+    if (_showingHistory) {
+      _exitHistory();
+      return true;
+    }
+
+    if (_completedJobSummary != null) {
+      setState(_dismissCompletedJobSummary);
+      return true;
+    }
+
+    if (_navMode) {
+      await _onBackDuringNavigation();
+      return true;
+    }
+
+    if (_editorEnabled && _tool != EditorTool.none) {
+      if ((_tool == EditorTool.drawOuter && _tempOuter.isNotEmpty) ||
+          (_tool == EditorTool.drawHole && _tempHole.isNotEmpty)) {
+        _undoLastPoint();
+        return true;
+      }
+      setState(() {
+        _tool = EditorTool.none;
+        _tempOuter.clear();
+        _tempHole.clear();
+        _editingIdx = null;
+      });
+      return true;
+    }
+
+    if (_selectedIdx.isNotEmpty) {
+      setState(() {
+        _selectedIdx.clear();
+        _suppressAutoPaddockSelect = true;
+      });
+      _rebuildPaddockLayers();
+      return true;
+    }
+
+    return false;
+  }
+
+  Future<void> _onBackDuringNavigation() async {
+    // Nothing meaningful recorded yet — just leave nav mode.
+    if (_jobStartTime == null || _jobPath.length < 2) {
+      await _finishJob();
+      return;
+    }
+    if (!mounted) return;
+    final choice = await showDialog<String>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('End job?'),
+        content: const Text('Finish and save this job, or keep navigating?'),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, 'keep'),
+            child: const Text('Keep going'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, 'finish'),
+            child: const Text('Finish'),
+          ),
+        ],
+      ),
+    );
+    if (choice == 'finish' && mounted) await _finishJob();
+  }
+
+  Future<void> _showHistoryJobsFromPaths(List<String> paths) async {
+    if (paths.isEmpty || !mounted) return;
+    _closeEndDrawer();
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const Center(child: CircularProgressIndicator()),
+    );
+    try {
+      final jobs = <SavedJob>[];
+      for (final p in paths) {
+        jobs.add(await JobStore.read(p));
+      }
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      _showHistoryJobs(jobs);
+    } catch (e) {
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not load job: $e')),
+      );
+    }
+  }
+
+  // ---------- Swath builder ----------
+  List<Polygon> _swathPolygonsForJob(SavedJob job) {
+    return _swathPolygonsFromPath(job.path, _jobSwathWidthM(job));
   }
 
   List<Polygon> _swathPolygonsFromPath(
@@ -945,71 +1469,242 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     )).toList();
   }
 
+  void _clearSwathDisplay() {
+    _committedSwathPolys.clear();
+    _swathCommittedBoomLen = 0;
+    _lastSwathCommitMs = 0;
+    _swathCommittedNotifier.value = [];
+    _swathLiveNotifier.value = null;
+    _navPathCommittedNotifier.value = null;
+    _navPathTailNotifier.value = null;
+  }
+
+  Polygon? _swathPolygonFromRing(List<LatLng> ring) {
+    if (ring.length < 3) return null;
+    return Polygon(
+      points: ring,
+      color: _swathColor.withOpacity(_swathOpacity),
+      borderColor: Colors.transparent,
+      borderStrokeWidth: 0,
+      isFilled: true,
+    );
+  }
+
+  List<LatLng> _boomPathForDisplay(List<LatLng> boom) {
+    if (boom.length < 2) return [];
+    if (boom.length > _swathDisplaySimplifyAfter) {
+      return simplifySwathPath(boom, minDistM: _swathDisplaySimplifyMinDistM);
+    }
+    return boom;
+  }
+
+  /// Live tip only — last few boom points + current tip (cheap).
+  void _syncLiveSwathTip() {
+    if (!_navMode) {
+      _swathLiveNotifier.value = null;
+      return;
+    }
+    final tipPath = _liveBoomTipPath();
+    if (tipPath.length < 2) {
+      _swathLiveNotifier.value = null;
+      return;
+    }
+    final rings = buildSwathRingsFromPath(tipPath, _currentSwathWidthM());
+    if (rings.isEmpty) {
+      _swathLiveNotifier.value = null;
+      return;
+    }
+    _swathLiveNotifier.value = _swathPolygonFromRing(rings.last);
+  }
+
+  List<LatLng> _liveBoomTipPath() {
+    final boom = _jobPath;
+    if (boom.isEmpty) return const [];
+    final start = boom.length > 4 ? boom.length - 4 : 0;
+    final tip = List<LatLng>.from(boom.sublist(start));
+    final live = _liveGpsForSwathTip();
+    final bearing = _pathTravelBearingDeg();
+    if (live != null && bearing != null) {
+      final center = _implementGeometryAt(live, bearingDeg: bearing).implementCenter;
+      if (tip.isEmpty ||
+          const Distance().as(LengthUnit.Meter, tip.last, center) >= 0.05) {
+        tip.add(center);
+      }
+    }
+    return tip;
+  }
+
+  /// Append new swath rings for boom advance; throttled / min-advance gated.
+  void _maybeCommitSwath({bool force = false}) {
+    if (!_navMode) return;
+    final boom = _jobPath;
+    if (boom.length < 2) return;
+
+    final ms = DateTime.now().millisecondsSinceEpoch;
+    if (!force && ms - _lastSwathCommitMs < _swathCommitIntervalMs) return;
+
+    final start = _swathCommittedBoomLen > 0 ? _swathCommittedBoomLen - 1 : 0;
+    if (boom.length - start < 2) return;
+
+    var advanceM = 0.0;
+    for (int i = start + 1; i < boom.length; i++) {
+      advanceM += const Distance().as(LengthUnit.Meter, boom[i - 1], boom[i]);
+    }
+    final newPts = boom.length - _swathCommittedBoomLen;
+    if (!force &&
+        advanceM < _swathCommitMinAdvanceM &&
+        newPts < 4) {
+      return;
+    }
+
+    _lastSwathCommitMs = ms;
+    var segment = boom.sublist(start);
+    segment = _boomPathForDisplay(segment);
+    if (segment.length < 2) {
+      _swathCommittedBoomLen = boom.length;
+      return;
+    }
+
+    final rings = buildSwathRingsFromPath(segment, _currentSwathWidthM());
+    var added = false;
+    for (final ring in rings) {
+      final poly = _swathPolygonFromRing(ring);
+      if (poly == null) continue;
+      _committedSwathPolys.add(poly);
+      added = true;
+    }
+    _swathCommittedBoomLen = boom.length;
+    if (added || force) {
+      _swathCommittedNotifier.value = List<Polygon>.from(_committedSwathPolys);
+    }
+  }
+
+  void _syncSwathDisplay({bool forceCommit = false}) {
+    if (!_navMode) {
+      // Don't wipe a finished-job preview sitting under the summary panel.
+      if (_completedJobSummary == null) {
+        _clearSwathDisplay();
+      }
+      return;
+    }
+    _maybeCommitSwath(force: forceCommit);
+    _syncLiveSwathTip();
+  }
+
+  void _syncNavPathCommitted() {
+    if (_jobPath.length < 2) {
+      if (_navPathCommittedNotifier.value != null) {
+        _navPathCommittedNotifier.value = null;
+      }
+      return;
+    }
+    _navPathCommittedNotifier.value = Polyline(
+      points: List<LatLng>.from(_jobPath),
+      strokeWidth: 2.5,
+      color: _swathColor.withOpacity(_swathOpacity),
+    );
+  }
+
+  void _syncNavPathTail() {
+    if (!_navMode || _jobPath.isEmpty) {
+      if (_navPathTailNotifier.value != null) _navPathTailNotifier.value = null;
+      return;
+    }
+    final bearing = _pathTravelBearingDeg();
+    final live = _liveGpsForSwathTip();
+    if (bearing == null || live == null) {
+      if (_navPathTailNotifier.value != null) _navPathTailNotifier.value = null;
+      return;
+    }
+    final tip = _implementGeometryAt(live, bearingDeg: bearing).implementCenter;
+    final last = _jobPath.last;
+    if (const Distance().as(LengthUnit.Meter, last, tip) < 0.01) {
+      if (_navPathTailNotifier.value != null) _navPathTailNotifier.value = null;
+      return;
+    }
+    _navPathTailNotifier.value = Polyline(
+      points: [last, tip],
+      strokeWidth: 2.5,
+      color: _swathColor.withOpacity(_swathOpacity),
+    );
+  }
+
+  void _updateNavPathDisplay() {
+    _syncNavPathCommitted();
+    _syncNavPathTail();
+  }
+
   void _refreshSwathPolygons() {
-    _swathPolys
-      ..clear()
-      ..addAll(_swathPolygonsFromStamps(_jobStamps, _currentSwathWidthM()));
+    _rebuildJobPathFromGps();
+    _syncSwathDisplay(forceCommit: true);
   }
 
   void _rebuildNavOverlays() {
-    _swathRebuildCounter = 0;
     if (_jobPath.length >= 2) {
-      _navPathPolyline = Polyline(
-        points: List<LatLng>.from(_jobPath),
-        strokeWidth: 2.5,
-        color: _swathColor.withOpacity(_swathOpacity),
-      );
+      _syncNavPathCommitted();
+      _syncNavPathTail();
     } else {
-      _navPathPolyline = null;
+      _navPathCommittedNotifier.value = null;
+      _navPathTailNotifier.value = null;
     }
     _refreshSwathPolygons();
   }
 
-  void _maybeRecordImplementPoint() {
+  void _maybeRecordSwathFromGps(GpsFix p) {
     if (!_navMode) return;
-    final center = _implementTracker.implementCenter;
-    if (center == null) return;
-    _recordSwathStamp(center, _implementTracker.implementHeadingDeg);
-  }
+    final gps = _currentPos;
+    if (gps == null) return;
 
-  void _recordSwathStamp(LatLng center, double headingDeg) {
-    if (_jobStamps.isNotEmpty) {
-      final last = _jobStamps.last.center;
-      final d = const Distance().as(LengthUnit.Meter, last, center);
-      if (d < 0.4) return;
+    final prev = _gpsRecordPath.isNotEmpty ? _gpsRecordPath.last : null;
+    var segM = 0.0;
+    if (prev != null) {
+      segM = const Distance().as(LengthUnit.Meter, prev, gps);
+      if (segM < _minGpsRecordM) return;
+      if (_gpsRecordPath.length >= 2 &&
+          isBackwardGpsStep(prev, _gpsRecordPath[_gpsRecordPath.length - 2], gps)) {
+        return;
+      }
+      if (segM > _maxGpsJumpM) {
+        _gpsRecordPath.add(gps);
+        _lastTravelBearingDeg = const Distance().bearing(prev, gps);
+        _rebuildJobPathFromGps();
+        _syncNavPathCommitted();
+        _syncSwathDisplay(forceCommit: true);
+        return;
+      }
     }
 
-    if (_jobStamps.isEmpty) {
-      _jobStamps.add(SwathStamp(center, headingDeg));
-      _jobPath.add(center);
-      return;
+    final prevBoom = _jobPath.isNotEmpty ? _jobPath.last : null;
+
+    _gpsRecordPath.add(gps);
+    if (prev != null) {
+      _lastTravelBearingDeg = const Distance().bearing(prev, gps);
+    }
+    _rebuildJobPathFromGps();
+
+    // Applied metres from boom-centre advance (less GPS zig-zag inflation).
+    // Overlaps still count because separate passes still add length.
+    final speedOk = p.hasSpeed && p.speedMps! >= _minMovingSpeedMps;
+    if (prev != null &&
+        prevBoom != null &&
+        _jobPath.isNotEmpty &&
+        speedOk &&
+        (_selectedIdx.isEmpty ||
+            (_inSelectedPaddock(prev) && _inSelectedPaddock(gps)))) {
+      final boomSegM =
+          const Distance().as(LengthUnit.Meter, prevBoom, _jobPath.last);
+      if (boomSegM > 0 &&
+          boomSegM <= _maxGpsJumpM &&
+          !_isSharpZigZagBoomStep(boomSegM)) {
+        _appliedDistanceM += boomSegM;
+      }
     }
 
-    final last = _jobStamps.last.center;
-    final d = const Distance().as(LengthUnit.Meter, last, center);
-
-    _jobStamps.add(SwathStamp(center, headingDeg));
-    _jobPath.add(center);
-    _jobDistanceM += d;
-
-    if (_selectedIdx.isEmpty ||
-        (_inSelectedPaddock(last) && _inSelectedPaddock(center))) {
-      _appliedDistanceM += d;
-    }
-
-    if (_jobPath.length >= 2) {
-      _navPathPolyline = Polyline(
-        points: List<LatLng>.from(_jobPath),
-        strokeWidth: 2.5,
-        color: _swathColor.withOpacity(_swathOpacity),
-      );
-    }
-
-    _swathRebuildCounter++;
-    if (_swathRebuildCounter >= _swathRebuildEveryN) {
-      _swathRebuildCounter = 0;
-      _refreshSwathPolygons();
-    }
+    _syncNavPathCommitted();
+    _syncNavPathTail();
+    _maybeCommitSwath();
+    _syncLiveSwathTip();
+    _navHudTickNotifier.value++;
   }
 
   // ---------- Look-ahead line ----------
@@ -1050,7 +1745,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         ));
       }
     }
-    _navLines = polys;
+    _navLinesNotifier.value = polys;
   }
 
   /// A→B bearing when traveling forward, B→A bearing when traveling reverse.
@@ -1181,14 +1876,45 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
 
     final polylines = <List<List<LatLng>>>[];
+    final mid = LatLng((a.latitude + b.latitude) * 0.5, (a.longitude + b.longitude) * 0.5);
+
+    double maxSpan;
+    double alongExtentM;
+    if (_selectedIdx.isEmpty) {
+      maxSpan = _approxSpanMeters(_mapController.camera.visibleBounds);
+      alongExtentM = maxSpan * 2;
+    } else {
+      final rings = <List<LatLng>>[];
+      for (final i in _selectedIdx) {
+        rings.add(_paddocks[i].outer);
+      }
+      final perpExtent = guidancePerpendicularExtentM(
+        origin: mid,
+        normalEast: nE,
+        normalNorth: nN,
+        outerRings: rings,
+      );
+      maxSpan = guidanceParallelSpanM(
+        perpendicularExtentM: perpExtent,
+        safetyFactor: _guidanceSafetyFactor,
+        capM: _guidanceMaxSpanCapM,
+        minSpanM: widthM,
+      );
+      alongExtentM = guidanceAlongTrackExtentM(
+        origin: mid,
+        tangentEast: tE,
+        tangentNorth: tN,
+        outerRings: rings,
+      );
+    }
+    final alongL = alongExtentM * _guidanceAlongTrackMargin;
 
     void addParallel(double kMeters) {
       final baseA = offsetM(aOff, nE * kMeters, nN * kMeters);
       final baseB = offsetM(bOff, nE * kMeters, nN * kMeters);
 
-      const L = 12000.0; // extend so clipping hits boundary tidily
-      final extA = offsetM(baseA, -tE * L, -tN * L);
-      final extB = offsetM(baseB, tE * L, tN * L);
+      final extA = offsetM(baseA, -tE * alongL, -tN * alongL);
+      final extB = offsetM(baseB, tE * alongL, tN * alongL);
 
       final segs = clipJob(extA, extB);
       if (segs.isNotEmpty) polylines.add(segs);
@@ -1197,9 +1923,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     // centre A–B line first, then parallels at implement width.
     addParallel(0);
 
-    final maxSpan = _selectedIdx.isEmpty
-        ? _approxSpanMeters(_mapController.camera.visibleBounds)
-        : 2500.0;
     for (double k = widthM; k <= maxSpan; k += widthM) {
       addParallel(k);
       addParallel(-k);
@@ -1217,22 +1940,35 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _guidanceParallelLines.isEmpty ||
         _pointA == null ||
         _pointB == null) {
-      _signedErrorM = 0;
+      if (_signedErrorNotifier.value != 0) _signedErrorNotifier.value = 0;
       return;
     }
 
-    final p = _implementTracker.implementCenter ?? _dispPos!;
+    final p = _dispPos!;
     final travelBearing = _guidanceTravelBearingDeg();
+    final lineCount = _guidanceParallelLines.length;
 
-    var bestIdx = 0;
+    var bestIdx = _activeLineIndex.clamp(0, lineCount - 1);
     var bestDist = double.infinity;
-    for (int i = 0; i < _guidanceParallelLines.length; i++) {
+
+    void evalIndex(int i) {
       for (final seg in _guidanceParallelLines[i]) {
         final r = _crossTrackToPolyline(p, seg, travelBearing);
         if (r.distance < bestDist) {
           bestDist = r.distance;
           bestIdx = i;
         }
+      }
+    }
+
+    final center = _activeLineIndex.clamp(0, lineCount - 1);
+    final lo = math.max(0, center - _guidanceScanRadius);
+    final hi = math.min(lineCount - 1, center + _guidanceScanRadius);
+    for (int i = lo; i <= hi; i++) evalIndex(i);
+    if (bestIdx == lo || bestIdx == hi) {
+      for (int i = 0; i < lineCount; i++) {
+        if (i >= lo && i <= hi) continue;
+        evalIndex(i);
       }
     }
 
@@ -1245,12 +1981,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         signed = r.signed;
       }
     }
-    _signedErrorM = signed;
+    if (_signedErrorNotifier.value != signed) {
+      _signedErrorNotifier.value = signed;
+    }
 
     if (bestIdx != _activeLineIndex) {
       _activeLineIndex = bestIdx;
       _syncNavLinePolylines();
-      if (mounted) setState(() {});
     }
   }
 
@@ -1292,15 +2029,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _selectedIdx.clear();
       _suppressAutoPaddockSelect = false;
       _navMode = false;
-      _navLines = [];
+      _navLinesNotifier.value = [];
       _guidanceParallelLines = [];
       _pointA = null;
       _pointB = null;
       _lookAheadNotifier.value = null;
-      _swathPolys.clear();
-      _navPathPolyline = null;
+      _clearSwathDisplay();
       _maybeAutoSelectPaddockFromGps();
     });
+    _rebuildPaddockLayers();
 
     if (_paddocks.isNotEmpty && _mapReady) {
       _mapController.move(_paddocks.first.labelPoint, 16);
@@ -1328,6 +2065,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           _selectedIdx.clear();
         });
       }
+      _rebuildPaddockLayers();
       return;
     }
 
@@ -1349,6 +2087,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             ..add(hit);
           _editingIdx = hit;
         });
+        _rebuildPaddockLayers();
       }
       return;
     }
@@ -1367,6 +2106,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _editingIdx = null;
       });
     }
+    _rebuildPaddockLayers();
 
 
 
@@ -1459,10 +2199,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   void _maybeAutoSelectPaddockFromGps() {
-    if (_navMode || _showingHistory || _editorEnabled) return;
-    if (_dispPos == null || _paddocks.isEmpty) return;
+    if (_showingHistory || _editorEnabled) return;
+    final pos = _dispPos ?? _currentPos;
+    if (pos == null || _paddocks.isEmpty) return;
 
-    final hit = _hitTestPaddock(_dispPos!);
+    final nowMs = DateTime.now().millisecondsSinceEpoch;
+    if (nowMs - _lastAutoSelectMs < _autoSelectIntervalMs) return;
+    _lastAutoSelectMs = nowMs;
+
+    final hit = _hitTestPaddock(pos);
     if (hit == null) {
       _lastGpsInsidePaddockIdx = null;
       return;
@@ -1480,26 +2225,38 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _lastGpsInsidePaddockIdx = hit;
     if (_selectedIdx.length == 1 && _selectedIdx.first == hit) return;
 
-    _selectedIdx
-      ..clear()
-      ..add(hit);
+    if (!mounted) return;
+    setState(() {
+      _selectedIdx
+        ..clear()
+        ..add(hit);
+    });
+    _rebuildPaddockLayers();
   }
 
   void _showCompletedJobOnMap(SavedJob job) {
-    _swathPolys
-      ..clear()
-      ..addAll(_swathPolygonsForJob(job));
-    _navPathPolyline = job.path.length >= 2
+    // Keep the force-committed live swath from the just-finished job. Rebuilding
+    // from the simplified save path can drop rings (reversal/jump splitting) and
+    // leave only the centreline visible.
+    if (_committedSwathPolys.isEmpty && job.path.length >= 2) {
+      _committedSwathPolys.addAll(_swathPolygonsForJob(job));
+    }
+    _swathCommittedNotifier.value = List<Polygon>.from(_committedSwathPolys);
+    _swathLiveNotifier.value = null;
+    _navPathCommittedNotifier.value = job.path.length >= 2
         ? Polyline(
             points: job.path,
             strokeWidth: 2.5,
-            color: _swathColor.withOpacity(_swathOpacity),
+            // Distinct from filled swath so both are visibly present.
+            color: Colors.white.withOpacity(0.9),
           )
         : null;
+    _navPathTailNotifier.value = null;
   }
 
-  void _dismissCompletedJobSummary() {
+  void _dismissCompletedJobSummary({bool clearMap = false}) {
     _completedJobSummary = null;
+    if (clearMap) _clearSwathDisplay();
   }
 
   void _maybeDismissCompletedSummaryOnGpsLeave() {
@@ -1518,7 +2275,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (hit != null && jobPaddockIndices.contains(hit)) return;
 
     setState(() {
-      _dismissCompletedJobSummary();
+      _dismissCompletedJobSummary(clearMap: true);
       _selectedIdx.clear();
       _suppressAutoPaddockSelect = false;
     });
@@ -1563,6 +2320,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         if (!_selectedIdx.contains(_editingIdx)) _selectedIdx.add(_editingIdx!);
       });
       await _persistFarmJson(_buildFarmGeoJsonBytes());
+      _rebuildPaddockLayers();
       return;
     }
     if (_tool == EditorTool.drawHole && _editingIdx != null) {
@@ -1583,6 +2341,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final area = _areaHa(p.outer, p.holes);
     final lp = _labelPoint(p.outer, p.holes);
     _paddocks[idx] = Paddock(name: p.name, outer: p.outer, holes: p.holes, areaHa: area, labelPoint: lp);
+    _rebuildPaddockLayers();
   }
 
   double _areaHa(List<LatLng> outer, List<List<LatLng>> holes) {
@@ -1623,37 +2382,22 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _navMode = true;
       _pointA = null;
       _pointB = null;
-      _navLines = [];
+      _navLinesNotifier.value = [];
       _guidanceParallelLines = [];
       _lookAheadNotifier.value = null;
       _implementTracker.reset();
-      _swathRebuildCounter = 0;
+      _gpsRecordPath = [];
       _jobPath = [];
-      _jobStamps = [];
-      if (_currentPos != null || _dispPos != null) {
-        final gps = _currentPos ?? _dispPos!;
-        final hdg = _currentHeadingDeg ?? _dispHeadingDeg;
-        final start = _implementTracker.layout(
-          gpsPos: gps,
-          gpsHeadingDeg: hdg,
-          gpsToPivotM: _gpsToPivotM(),
-          gpsLateralOffsetM: _gpsLateralM(),
-          hitchToAxleM: _hitchToAxleM(),
-          axleToBoomM: _axleToBoomM(),
-          widthM: _currentSwathWidthM(),
-          lateralOffsetM: _toMeters(_offset),
-          mount: _implementMount,
-        );
-        _jobStamps = [
-          SwathStamp(start.implementCenter, start.implementHeadingDeg),
-        ];
-        _jobPath = [start.implementCenter];
+      _lastTravelBearingDeg = null;
+      _speedDistanceM = 0.0;
+      _lastSpeedFixTime = null;
+      if (_currentPos != null) {
+        _gpsRecordPath.add(_currentPos!);
+        _rebuildJobPathFromGps();
       }
-      _jobDistanceM = 0.0;
       _appliedDistanceM = 0.0;
       _currentSpeedKph = 0.0;
-      _swathPolys.clear();
-      _navPathPolyline = null;
+      _clearSwathDisplay();
       _showingHistory = false;
       _activeHistoryJobs = [];
       _completedJobSummary = null;
@@ -1662,7 +2406,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _histSelecting = false;
       _histSelected.clear();
       _jobStartTime = DateTime.now();
-      _signedErrorM = 0;
+      _signedErrorNotifier.value = 0;
       _rotationMode = RotationMode.travelUp;
       _followGps = true;
     });
@@ -1681,65 +2425,110 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _mapController.move(p, z.clamp(5.0, 22.0));
     }
     if (_jobPath.isNotEmpty) _rebuildNavOverlays();
+    _updateImplementGeometry();
     _updateLookAhead();
   }
 
   Future<void> _finishJob() async {
+    if (_jobFinishInProgress) return;
+
     if (!_navMode || _jobStartTime == null || _jobPath.length < 2) {
       setState(() {
         _navMode = false;
         _pointA = null;
         _pointB = null;
-        _navLines.clear();
+        _navLinesNotifier.value = [];
         _guidanceParallelLines.clear();
         _lookAheadNotifier.value = null;
       });
       _resetToMapDefaults();
       return;
     }
-    final end = DateTime.now();
-    final durHrs = end.difference(_jobStartTime!).inMilliseconds / 3600000.0;
-    final avgKph = durHrs > 0 ? (_jobDistanceM / 1000.0) / durHrs : 0.0;
 
-    final names = _selectedIdx.map((i) => _paddocks[i].name).toList()..sort();
-    final totalHa = _selectedIdx.fold(0.0, (s, i) => s + _paddocks[i].areaHa);
-
-    final n = await JobStore.nextSequenceForDay(end);
-    final id = JobStore.dayTitle(end, n);
-
-    final displayWidth = _currentWidthDisplay();
-    final widthM = _toMeters(displayWidth);
-
-    final job = SavedJob(
-      id: id,
-      startedAt: _jobStartTime!,
-      endedAt: end,
-      path: List<LatLng>.from(_jobPath),
-      pathHeadingsDeg: _jobStamps.map((s) => s.headingDeg).toList(),
-      paddockNames: names,
-      totalHa: totalHa,
-      avgSpeedKph: avgKph,
-      swathWidthM: widthM,
-      pathDistanceM: _appliedDistanceM,
-      swathWidthSetting: displayWidth,
-      unitsAtSave: _units,
-      hasSavedSwathWidth: true,
-    );
-    await JobStore.save(job);
-
+    _jobFinishInProgress = true;
     if (!mounted) return;
+    showDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (_) => const PopScope(
+        canPop: false,
+        child: Center(child: CircularProgressIndicator()),
+      ),
+    );
+    try {
+      await Future<void>.delayed(Duration.zero);
+      // Flush any uncommitted live tip into the display before leaving nav.
+      _maybeCommitSwath(force: true);
+      final end = DateTime.now();
 
-    setState(() {
-      _navMode = false; // hides error HUD
-      _pointA = null;
-      _pointB = null;
-      _navLines.clear();
-      _guidanceParallelLines.clear();
-      _lookAheadNotifier.value = null;
-      _completedJobSummary = job;
-      _showCompletedJobOnMap(job);
-    });
-    _resetToMapDefaults();
+      final savedPath = simplifySwathPath(
+        _jobPath,
+        minDistM: _jobSaveSimplifyMinDistM,
+      );
+      // Prefer live boom-gated applied metres; fall back to simplified path length.
+      final pathDistanceM = _appliedDistanceM > 0
+          ? _appliedDistanceM
+          : pathDistanceMeters(savedPath);
+
+      final durHrs = end.difference(_jobStartTime!).inMilliseconds / 3600000.0;
+      final avgKph = durHrs > 0 ? (_speedDistanceM / 1000.0) / durHrs : 0.0;
+
+      final names = _selectedIdx.map((i) => _paddocks[i].name).toList()..sort();
+      final totalHa = _selectedIdx.fold(0.0, (s, i) => s + _paddocks[i].areaHa);
+
+      final n = await JobStore.nextSequenceForDay(end);
+      final id = JobStore.dayTitle(end, n);
+
+      final displayWidth = _currentWidthDisplay();
+      final widthM = _toMeters(displayWidth);
+
+      final job = SavedJob(
+        id: id,
+        startedAt: _jobStartTime!,
+        endedAt: end,
+        path: savedPath,
+        paddockNames: names,
+        totalHa: totalHa,
+        avgSpeedKph: avgKph,
+        swathWidthM: widthM,
+        pathDistanceM: pathDistanceM,
+        swathWidthSetting: displayWidth,
+        unitsAtSave: _units,
+        hasSavedSwathWidth: true,
+      );
+
+      await JobStore.save(job);
+
+      if (!mounted) return;
+      Navigator.of(context, rootNavigator: true).pop();
+
+      setState(() {
+        _navMode = false;
+        _pointA = null;
+        _pointB = null;
+        _navLinesNotifier.value = [];
+        _guidanceParallelLines.clear();
+        _lookAheadNotifier.value = null;
+        _completedJobSummary = job;
+        _showCompletedJobOnMap(job);
+        _invalidateJobSummariesCache();
+      });
+      _resetToMapDefaults();
+    } catch (e) {
+      if (mounted) {
+        if (Navigator.of(context, rootNavigator: true).canPop()) {
+          Navigator.of(context, rootNavigator: true).pop();
+        }
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('Could not save job: $e'),
+            backgroundColor: Colors.red.shade700,
+          ),
+        );
+      }
+    } finally {
+      _jobFinishInProgress = false;
+    }
   }
 
   void _markA() {
@@ -1747,9 +2536,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     setState(() {
       _pointA = _dispPos;
       _pointB = null;
-      _navLines = [];
+      _navLinesNotifier.value = [];
       _guidanceParallelLines = [];
-      _signedErrorM = 0;
+      _signedErrorNotifier.value = 0;
     });
   }
 
@@ -1805,14 +2594,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       smoothnessHint: _gpsSmoothnessLabel(),
       presets: _toolPresets,
       selectedPresetName: _selectedToolPresetName,
-      onUnitsChanged: (u) => setState(() => _units = u),
+      onUnitsChanged: (u) {
+        setState(() => _units = u);
+        _rebuildPaddockLayers();
+      },
       onDimensionsChanged: (d) {
-        final mountChanged = d.mount != _toolDims.mount;
         setState(() {
           _toolDims = d;
           _selectedToolPresetName = null;
         });
-        if (mountChanged) _implementTracker.reset();
         _updateImplementGeometry();
       },
       onGpsSmoothnessChanged: (v) {
@@ -1867,9 +2657,170 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   Widget _settingsTab() {
-    return ListView(
+    return ListenableBuilder(
+      listenable: _gpsInput,
+      builder: (context, _) {
+        return ListView(
       padding: const EdgeInsets.only(bottom: 24),
       children: [
+        const ListTile(title: Text('GPS input', style: TextStyle(fontWeight: FontWeight.bold))),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: DropdownButtonFormField<GpsInputMode>(
+            value: _gpsInput.mode,
+            decoration: const InputDecoration(
+              labelText: 'Source',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            items: GpsInputMode.values
+                .map((m) => DropdownMenuItem(value: m, child: Text(m.label)))
+                .toList(),
+            onChanged: (m) async {
+              if (m == null) return;
+              await _gpsInput.setMode(m);
+              await _savePrefs();
+            },
+          ),
+        ),
+        if (_gpsInput.mode != GpsInputMode.device) ...[
+          const SizedBox(height: 8),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 16),
+            child: DropdownButtonFormField<int>(
+              value: _gpsInput.baudRate,
+              decoration: const InputDecoration(
+                labelText: 'Baud rate',
+                border: OutlineInputBorder(),
+                isDense: true,
+              ),
+              items: const [
+                DropdownMenuItem(value: 9600, child: Text('9600')),
+                DropdownMenuItem(value: 38400, child: Text('38400')),
+                DropdownMenuItem(value: 57600, child: Text('57600')),
+                DropdownMenuItem(value: 115200, child: Text('115200')),
+                DropdownMenuItem(value: 230400, child: Text('230400')),
+              ],
+              onChanged: (v) async {
+                if (v == null) return;
+                await _gpsInput.setBaudRate(v);
+                await _savePrefs();
+              },
+            ),
+          ),
+          if (_gpsInput.devices.isNotEmpty) ...[
+            const SizedBox(height: 8),
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 16),
+              child: DropdownButtonFormField<String?>(
+                isExpanded: true,
+                value: () {
+                  final vid = _gpsInput.preferredVid;
+                  final pid = _gpsInput.preferredPid;
+                  if (vid != null && pid != null) return '$vid:$pid';
+                  if (_gpsInput.devices.length == 1) {
+                    return _gpsInput.devices.first.stableKey;
+                  }
+                  return null;
+                }(),
+                decoration: const InputDecoration(
+                  labelText: 'USB device',
+                  border: OutlineInputBorder(),
+                  isDense: true,
+                ),
+                items: [
+                  const DropdownMenuItem<String?>(
+                    value: null,
+                    child: Text(
+                      'Auto (first device)',
+                      overflow: TextOverflow.ellipsis,
+                    ),
+                  ),
+                  ..._gpsInput.devices.map(
+                    (d) => DropdownMenuItem<String?>(
+                      value: d.stableKey ?? 'id:${d.deviceId}',
+                      child: Text(
+                        '${d.displayName} (${d.vidPidLabel})',
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                      ),
+                    ),
+                  ),
+                ],
+                onChanged: (key) async {
+                  if (key == null) {
+                    await _gpsInput.setPreferredDevice(null);
+                  } else {
+                    UsbDeviceInfo? match;
+                    for (final d in _gpsInput.devices) {
+                      if (d.stableKey == key || 'id:${d.deviceId}' == key) {
+                        match = d;
+                        break;
+                      }
+                    }
+                    await _gpsInput.setPreferredDevice(match);
+                  }
+                  await _savePrefs();
+                },
+              ),
+            ),
+          ],
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
+            child: Text(
+              'Close GPS Connector while using in-app USB — only one app can own the dongle.',
+              style: TextStyle(
+                fontSize: 12,
+                color: Theme.of(context).colorScheme.onSurfaceVariant,
+              ),
+            ),
+          ),
+        ],
+        ListTile(
+          title: Text(_gpsInput.statusMessage),
+          subtitle: Text(_gpsQualitySubtitle()),
+          trailing: IconButton(
+            tooltip: 'Reconnect',
+            icon: const Icon(Icons.refresh),
+            onPressed: () async {
+              await _gpsInput.reconnect();
+            },
+          ),
+        ),
+        if (_gpsInput.activeSource != GpsActiveSource.none)
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+            child: Row(
+              children: [
+                Expanded(
+                  child: _gpsQualityChip(
+                    'Sats',
+                    _gpsInput.satellites?.toString() ?? '—',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _gpsQualityChip(
+                    'Accuracy',
+                    _gpsInput.accuracyM == null
+                        ? '—'
+                        : '±${_gpsInput.accuracyM!.toStringAsFixed(1)} m',
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: _gpsQualityChip(
+                    'Rate',
+                    _gpsInput.fixHz <= 0
+                        ? '—'
+                        : '${_gpsInput.fixHz.toStringAsFixed(1)} Hz',
+                  ),
+                ),
+              ],
+            ),
+          ),
+        const Divider(),
+
         const ListTile(title: Text('Map & Tiles', style: TextStyle(fontWeight: FontWeight.bold))),
         SwitchListTile(
           title: const Text('Satellite view (Esri)'),
@@ -1878,6 +2829,32 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             setState(() => _satellite = v);
             _savePrefs();
           },
+        ),
+        const Divider(),
+
+        const ListTile(title: Text('Appearance', style: TextStyle(fontWeight: FontWeight.bold))),
+        Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 16),
+          child: DropdownButtonFormField<ThemeMode>(
+            value: widget.themeController.mode,
+            decoration: const InputDecoration(
+              labelText: 'Theme',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            items: ThemeMode.values
+                .map((m) => DropdownMenuItem(
+                      value: m,
+                      child: Text(ThemeController.label(m)),
+                    ))
+                .toList(),
+            onChanged: (m) async {
+              if (m == null) return;
+              await widget.themeController.setMode(m);
+              if (mounted) setState(() {});
+              await _savePrefs();
+            },
+          ),
         ),
         const Divider(),
 
@@ -1901,14 +2878,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 _paddocks = [];
                 _selectedIdx.clear();
                 _navMode = false;
-                _navLines = [];
+                _navLinesNotifier.value = [];
       _guidanceParallelLines = [];
                 _pointA = null;
                 _pointB = null;
                 _lookAheadNotifier.value = null;
-                _swathPolys.clear();
-                _navPathPolyline = null;
+      _clearSwathDisplay();
               });
+              _rebuildPaddockLayers();
               final p = await SharedPreferences.getInstance();
               await p.remove('farmJsonPath');
               _persistedJsonPath = null;
@@ -1949,7 +2926,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           onTap: _restoreBackup,
         ),
         FutureBuilder<List<BackupInfo>>(
-          future: BackupStore.listBackups(),
+          future: _backupsFutureOrLoad(),
           builder: (context, snap) {
             final backups = snap.data ?? const [];
             if (backups.isEmpty) return const SizedBox.shrink();
@@ -1998,6 +2975,59 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           },
         ),
       ],
+        );
+      },
+    );
+  }
+
+  Future<List<BackupInfo>> _backupsFutureOrLoad() {
+    return _backupsFuture ??= BackupStore.listBackups();
+  }
+
+  void _invalidateBackupsFuture() {
+    _backupsFuture = null;
+  }
+
+  String _gpsQualitySubtitle() {
+    final active = switch (_gpsInput.activeSource) {
+      GpsActiveSource.usb => 'Active: USB',
+      GpsActiveSource.device => 'Active: device GPS',
+      GpsActiveSource.none => 'Active: none',
+    };
+    final hint = _gpsInput.connectionHint;
+    if (hint != null && hint.isNotEmpty) return '$active · $hint';
+    return active;
+  }
+
+  Widget _gpsQualityChip(String label, String value) {
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+      decoration: BoxDecoration(
+        color: scheme.surfaceContainerHighest.withOpacity(0.55),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              color: scheme.onSurfaceVariant,
+            ),
+          ),
+          const SizedBox(height: 2),
+          Text(
+            value,
+            style: TextStyle(
+              fontSize: 15,
+              fontWeight: FontWeight.w700,
+              color: scheme.onSurface,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -2023,21 +3053,27 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         : '${_currentWidthDisplay().toStringAsFixed(1)} m';
   }
 
-  String _formatTime(DateTime t) => '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+  double _summaryAreaAppliedHa(JobFileSummary job) =>
+      job.areaAppliedHaFor(_currentSwathWidthM());
 
-  Future<List<({String path, SavedJob job})>> _loadAllJobs() async {
-    final files = await JobStore.listJobFiles();
-    final rows = <({String path, SavedJob job})>[];
-    for (final f in files) {
-      rows.add((path: f, job: await JobStore.read(f)));
-    }
-    rows.sort((a, b) => b.job.startedAt.compareTo(a.job.startedAt));
-    return rows;
+  double _summaryCoveragePercent(JobFileSummary job) =>
+      job.coveragePercentFor(_currentSwathWidthM());
+
+  void _invalidateJobSummariesCache() {
+    _historyListGeneration++;
+    _jobSummariesFuture = JobStore.listJobSummaries();
   }
 
+  Future<List<JobFileSummary>> _jobSummariesFutureOrLoad() {
+    return _jobSummariesFuture ??= JobStore.listJobSummaries();
+  }
+
+  String _formatTime(DateTime t) => '${t.hour.toString().padLeft(2, '0')}:${t.minute.toString().padLeft(2, '0')}';
+
   Widget _historyTab() {
-    return FutureBuilder<List<({String path, SavedJob job})>>(
-      future: _loadAllJobs(),
+    return FutureBuilder<List<JobFileSummary>>(
+      key: ValueKey(_historyListGeneration),
+      future: _jobSummariesFutureOrLoad(),
       builder: (context, snap) {
         if (!snap.hasData) {
           return const Center(child: CircularProgressIndicator());
@@ -2045,9 +3081,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         final rows = snap.data!;
         if (rows.isEmpty) return const Center(child: Text('No jobs saved yet.'));
 
-        final byDay = <DateTime, List<({String path, SavedJob job})>>{};
+        final byDay = <DateTime, List<JobFileSummary>>{};
         for (final row in rows) {
-          final day = DateTime(row.job.startedAt.year, row.job.startedAt.month, row.job.startedAt.day);
+          final day = DateTime(row.startedAt.year, row.startedAt.month, row.startedAt.day);
           byDay.putIfAbsent(day, () => []).add(row);
         }
         final days = byDay.keys.toList()..sort((a, b) => b.compareTo(a));
@@ -2055,9 +3091,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         double selectedTotalHa = 0;
         double selectedAppliedHa = 0;
         for (final row in rows) {
-          if (_histSelected.contains(row.path)) {
-            selectedTotalHa += row.job.totalHa;
-            selectedAppliedHa += _jobAreaAppliedHa(row.job);
+          if (_histSelected.contains(row.filePath)) {
+            selectedTotalHa += row.totalHa;
+            selectedAppliedHa += row.areaAppliedHaFor(_currentSwathWidthM());
           }
         }
         final selectedCoverage = selectedTotalHa > 0
@@ -2093,13 +3129,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                         constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
                         padding: EdgeInsets.zero,
                         onPressed: _histSelected.isEmpty ? null : () async {
-                          final jobs = <SavedJob>[];
-                          for (final p in _histSelected) {
-                            jobs.add(await JobStore.read(p));
-                          }
-                          if (!mounted) return;
-                          _showHistoryJobs(jobs);
-                          Navigator.of(context).maybePop();
+                          await _showHistoryJobsFromPaths(_histSelected.toList());
                         },
                         icon: const Icon(Icons.map_outlined),
                       ),
@@ -2134,7 +3164,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                           if (ok == true) {
                             for (final f in _histSelected) { await JobStore.delete(f); }
                             if (!mounted) return;
-                            setState(() { _histSelecting = false; _histSelected.clear(); });
+                            setState(() {
+                              _histSelecting = false;
+                              _histSelected.clear();
+                              _invalidateJobSummariesCache();
+                            });
                             ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Deleted')));
                           }
                         },
@@ -2153,10 +3187,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 itemBuilder: (context, di) {
                   final day = days[di];
                   final dayJobs = byDay[day]!;
-                  final dayPaths = dayJobs.map((e) => e.path).toSet();
+                  final dayPaths = dayJobs.map((e) => e.filePath).toSet();
                   final allDaySelected = dayPaths.every((p) => _histSelected.contains(p));
                   final expanded = _histExpandedDays.contains(day);
-                  final dayTotalHa = dayJobs.fold(0.0, (s, e) => s + e.job.totalHa);
+                  final dayTotalHa = dayJobs.fold(0.0, (s, e) => s + e.totalHa);
 
                   void toggleDaySelection() {
                     setState(() {
@@ -2189,8 +3223,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                               toggleDaySelection();
                               return;
                             }
-                            _showHistoryJobs(dayJobs.map((e) => e.job).toList());
-                            Navigator.of(context).maybePop();
+                            _showHistoryJobsFromPaths(
+                              dayJobs.map((e) => e.filePath).toList(),
+                            );
                           },
                           child: Padding(
                             padding: const EdgeInsets.fromLTRB(8, 8, 4, 8),
@@ -2255,17 +3290,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                               DataColumn(label: Text('Coverage', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12))),
                             ],
                             rows: dayJobs.map((entry) {
-                              final j = entry.job;
-                              final selected = _histSelected.contains(entry.path);
+                              final j = entry;
+                              final selected = _histSelected.contains(entry.filePath);
                               final paddock = j.paddockNames.join(', ');
                               return DataRow(
                                 selected: selected,
                                 onSelectChanged: _histSelecting ? (_) {
                                   setState(() {
                                     if (selected) {
-                                      _histSelected.remove(entry.path);
+                                      _histSelected.remove(entry.filePath);
                                     } else {
-                                      _histSelected.add(entry.path);
+                                      _histSelected.add(entry.filePath);
                                     }
                                   });
                                 } : null,
@@ -2276,27 +3311,26 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                                       if (_histSelecting) {
                                         setState(() {
                                           if (selected) {
-                                            _histSelected.remove(entry.path);
+                                            _histSelected.remove(entry.filePath);
                                           } else {
-                                            _histSelected.add(entry.path);
+                                            _histSelected.add(entry.filePath);
                                           }
                                         });
                                         return;
                                       }
-                                      _showHistoryJobs([j]);
-                                      if (mounted) Navigator.of(context).maybePop();
+                                      await _showHistoryJobsFromPaths([entry.filePath]);
                                     },
                                     onLongPress: () {
                                       setState(() {
                                         _histSelecting = true;
-                                        _histSelected.add(entry.path);
+                                        _histSelected.add(entry.filePath);
                                       });
                                     },
                                   ),
                                   DataCell(Text(_areaText(j.totalHa), style: const TextStyle(fontSize: 12))),
-                                  DataCell(Text(_areaText(_jobAreaAppliedHa(j)), style: const TextStyle(fontSize: 12))),
+                                  DataCell(Text(_areaText(_summaryAreaAppliedHa(j)), style: const TextStyle(fontSize: 12))),
                                   DataCell(Text(_formatTime(j.startedAt), style: const TextStyle(fontSize: 12))),
-                                  DataCell(Text('${_jobCoveragePercent(j).toStringAsFixed(0)}%', style: const TextStyle(fontSize: 12))),
+                                  DataCell(Text('${_summaryCoveragePercent(j).toStringAsFixed(0)}%', style: const TextStyle(fontSize: 12))),
                                 ],
                               );
                             }).toList(),
@@ -2333,8 +3367,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _showingHistory = true;
       _activeHistoryJobs = List.from(jobs);
       _dismissCompletedJobSummary();
-      _swathPolys.clear();
-      _navPathPolyline = null;
+      _clearSwathDisplay();
       _historySwathPolys
         ..clear()
         ..addAll(swaths);
@@ -2343,7 +3376,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         ..addAll(paths);
       _navMode = false;
       _selectedIdx.clear();
-      _navLines.clear();
+      _navLinesNotifier.value = [];
       _guidanceParallelLines.clear();
       _lookAheadNotifier.value = null;
       _followGps = false;
@@ -2375,13 +3408,27 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   Widget _completedJobSummaryPanel() {
     final j = _completedJobSummary!;
+    final scheme = Theme.of(context).colorScheme;
 
     Widget stat(String label, String value) {
       return Column(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(label, style: const TextStyle(fontSize: 11, color: Colors.black45)),
-          Text(value, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+          Text(
+            label,
+            style: TextStyle(
+              fontSize: 11,
+              color: scheme.onSecondaryContainer.withOpacity(0.75),
+            ),
+          ),
+          Text(
+            value,
+            style: TextStyle(
+              fontWeight: FontWeight.w600,
+              fontSize: 13,
+              color: scheme.onSecondaryContainer,
+            ),
+          ),
         ],
       );
     }
@@ -2389,7 +3436,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     return Material(
       elevation: 8,
       borderRadius: const BorderRadius.vertical(bottom: Radius.circular(12)),
-      color: Colors.green.shade50,
+      color: scheme.secondaryContainer,
       child: SafeArea(
         bottom: false,
         child: Padding(
@@ -2400,27 +3447,41 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             children: [
               Row(
                 children: [
-                  Icon(Icons.check_circle, color: Colors.green.shade700, size: 22),
+                  Icon(Icons.check_circle, color: scheme.onSecondaryContainer, size: 22),
                   const SizedBox(width: 8),
                   Expanded(
                     child: Text(
                       'Job complete',
-                      style: TextStyle(fontWeight: FontWeight.w700, fontSize: 16, color: Colors.green.shade900),
+                      style: TextStyle(
+                        fontWeight: FontWeight.w700,
+                        fontSize: 16,
+                        color: scheme.onSecondaryContainer,
+                      ),
                     ),
                   ),
                   IconButton(
                     tooltip: 'Dismiss',
-                    icon: const Icon(Icons.close),
+                    icon: Icon(Icons.close, color: scheme.onSecondaryContainer),
                     onPressed: () => setState(_dismissCompletedJobSummary),
                   ),
                 ],
               ),
               Text(
                 j.paddockNames.join(', '),
-                style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 15),
+                style: TextStyle(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 15,
+                  color: scheme.onSecondaryContainer,
+                ),
               ),
               const SizedBox(height: 2),
-              Text(j.id, style: const TextStyle(fontSize: 12, color: Colors.black54)),
+              Text(
+                j.id,
+                style: TextStyle(
+                  fontSize: 12,
+                  color: scheme.onSecondaryContainer.withOpacity(0.75),
+                ),
+              ),
               const SizedBox(height: 8),
               Wrap(
                 spacing: 16,
@@ -2436,7 +3497,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               const SizedBox(height: 6),
               Text(
                 '${_formatDayHeader(DateTime(j.startedAt.year, j.startedAt.month, j.startedAt.day))}  ${_formatTime(j.startedAt)} – ${_formatTime(j.endedAt)}',
-                style: const TextStyle(fontSize: 12, color: Colors.black54),
+                style: TextStyle(
+                  fontSize: 12,
+                  color: scheme.onSecondaryContainer.withOpacity(0.75),
+                ),
               ),
             ],
           ),
@@ -2462,13 +3526,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   Future<void> _showPaddockHistory(String paddockName) async {
-    final files = await JobStore.listJobFiles();
-    final rows = <SavedJob>[];
-    for (final f in files) {
-      final j = await JobStore.read(f);
-      if (j.paddockNames.contains(paddockName)) rows.add(j);
-    }
-    rows.sort((a, b) => b.startedAt.compareTo(a.startedAt));
+    final summaries = await JobStore.listJobSummaries();
+    final rows = summaries
+        .where((j) => j.paddockNames.contains(paddockName))
+        .toList();
 
     if (!mounted) return;
     // ignore: use_build_context_synchronously
@@ -2485,10 +3546,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             return ListTile(
               leading: const Icon(Icons.route),
               title: Text(j.id),
-              subtitle: Text('Area: ${j.totalHa.toStringAsFixed(1)} ha  •  Applied: ${_jobAreaAppliedHa(j).toStringAsFixed(1)} ha  •  ${_jobCoveragePercent(j).toStringAsFixed(0)}%'),
-              onTap: () {
-                _showHistoryJobs([j]);
+              subtitle: Text('Area: ${j.totalHa.toStringAsFixed(1)} ha  •  Applied: ${j.areaAppliedHaFor(_currentSwathWidthM()).toStringAsFixed(1)} ha  •  ${j.coveragePercentFor(_currentSwathWidthM()).toStringAsFixed(0)}%'),
+              onTap: () async {
                 Navigator.pop(ctx);
+                await _showHistoryJobsFromPaths([j.filePath]);
               },
             );
           },
@@ -2597,71 +3658,36 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       );
     }
 
-    // Polygons & labels
-    final List<Polygon> pdkPolys = [];
-    final List<Marker> pdkLabels = [];
-    for (int i = 0; i < _paddocks.length; i++) {
-      final pd = _paddocks[i];
-      final isSel = _selectedIdx.contains(i);
-      pdkPolys.add(
-        Polygon(
-          points: pd.outer,
-          holePointsList: pd.holes,
-          color: _overlayColor.withOpacity((_overlayOpacity + (isSel ? 0.08 : 0.0)).clamp(0.0, 1.0)),
-          borderColor: isSel ? Colors.yellow.shade700 : _overlayColor,
-          borderStrokeWidth: isSel ? 3.5 : 2.0,
-          isFilled: true,
-        ),
-      );
-      final zoom = _mapReady ? _mapController.camera.zoom : 0.0;
-      if (zoom >= 15.0) {
-        final labelAnchor = _safeLabelPoint(pd);
-        pdkLabels.add(
-          Marker(
-            point: labelAnchor,
-            width: 200,
-            height: 52,
-            alignment: Alignment.center,
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                Text(pd.name, textAlign: TextAlign.center, style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 14, color: Colors.black87)),
-                Text(_areaText(pd.areaHa), textAlign: TextAlign.center, style: const TextStyle(fontStyle: FontStyle.italic, fontSize: 11, color: Colors.black54)),
-              ],
-            ),
-          ),
-        );
-      }
-    }
-
     // Job selection summary + paddock name for history
     final double totalHa = _selectedIdx.fold(0.0, (s, i) => s + _paddocks[i].areaHa);
     final List<String> selectedNames = _selectedIdx.map((i) => _paddocks[i].name).toList()..sort();
-    final String jobTitle = selectedNames.join(', ');
     final String? singleSelectedName = _selectedIdx.length == 1 ? _paddocks[_selectedIdx.first].name : null;
-    const navDashboardHeight = 52.0;
+    const navDashboardContentHeight = 58.0;
     const navErrorHudHeight = 48.0;
     final navTopInset = _navMode
-        ? navDashboardHeight +
+        ? safe.top +
+            navDashboardContentHeight +
             ((_pointA != null && _pointB != null) ? navErrorHudHeight : 0.0)
         : 0.0;
 
-    return Scaffold(
+    final topChromeInset = _navMode
+        ? navTopInset + _fabEdge
+        : safe.top + _fabEdge + _fabSecondaryDiameter + _fabGap;
+
+    return PopScope(
+      // Always intercept so we can close the drawer even if MapScreen
+      // hasn't rebuilt since it opened. Idle → SystemNavigator.pop.
+      canPop: false,
+      onPopInvokedWithResult: (didPop, result) async {
+        if (didPop) return;
+        final handled = await _handleSystemBack();
+        if (!handled && mounted) {
+          SystemNavigator.pop();
+        }
+      },
+      child: Scaffold(
       key: _scaffoldKey,
-      appBar: _navMode ? null : AppBar(
-        titleSpacing: 0,
-        title: Row(children: [
-          Padding(
-            padding: const EdgeInsets.only(right: 8),
-            child: Image.asset('assets/logo.png', height: 28, errorBuilder: (_, __, ___) => const Icon(Icons.agriculture)),
-          ),
-          const Text('PasturePath'),
-        ]),
-        leading: _showingHistory ? IconButton(icon: const Icon(Icons.arrow_back), onPressed: _exitHistory) : null,
-        actions: [
-          IconButton(icon: const Icon(Icons.menu), onPressed: () => _scaffoldKey.currentState?.openEndDrawer()),
-        ],
-      ),
+      appBar: null,
       endDrawer: _buildDrawer(),
       body: Stack(
         children: [
@@ -2677,10 +3703,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   _mapReady = true;
                   _maybeAutoSelectPaddockFromGps();
                 });
-                _applyMapRotation(0);
-                if (_followGps && _dispPos != null) {
-                  _mapController.move(_dispPos!, _mapController.camera.zoom);
-                }
+                _rebuildPaddockLayers();
+                _runAfterMapFrame(() {
+                  _applyMapRotation(0);
+                  if (_followGps && _dispPos != null) {
+                    _mapController.move(_dispPos!, _mapController.camera.zoom);
+                    _lastCameraTarget = _dispPos;
+                  }
+                });
               },
               onPositionChanged: _onMapPositionChanged,
               onMapEvent: _onMapEvent,
@@ -2700,13 +3730,47 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               ),
 
               // Draw paddocks first
-              if (pdkPolys.isNotEmpty) PolygonLayer(polygons: pdkPolys),
+              ValueListenableBuilder<List<Polygon>>(
+                valueListenable: _paddockPolysNotifier,
+                builder: (context, pdkPolys, _) {
+                  if (pdkPolys.isEmpty) return const SizedBox.shrink();
+                  return PolygonLayer(polygons: pdkPolys);
+                },
+              ),
 
               // Swath ABOVE paddocks so it's visible
-              if (!_showingHistory && _swathPolys.isNotEmpty)
-                PolygonLayer(polygons: _swathPolys),
-              if (!_showingHistory && _navPathPolyline != null)
-                PolylineLayer(polylines: [_navPathPolyline!]),
+              if (!_showingHistory)
+                ValueListenableBuilder<List<Polygon>>(
+                  valueListenable: _swathCommittedNotifier,
+                  builder: (context, polys, _) {
+                    if (polys.isEmpty) return const SizedBox.shrink();
+                    return PolygonLayer(polygons: polys);
+                  },
+                ),
+              if (!_showingHistory)
+                ValueListenableBuilder<Polygon?>(
+                  valueListenable: _swathLiveNotifier,
+                  builder: (context, live, _) {
+                    if (live == null) return const SizedBox.shrink();
+                    return PolygonLayer(polygons: [live]);
+                  },
+                ),
+              if (!_showingHistory)
+                ValueListenableBuilder<Polyline?>(
+                  valueListenable: _navPathCommittedNotifier,
+                  builder: (context, line, _) {
+                    if (line == null) return const SizedBox.shrink();
+                    return PolylineLayer(polylines: [line]);
+                  },
+                ),
+              if (!_showingHistory)
+                ValueListenableBuilder<Polyline?>(
+                  valueListenable: _navPathTailNotifier,
+                  builder: (context, line, _) {
+                    if (line == null) return const SizedBox.shrink();
+                    return PolylineLayer(polylines: [line]);
+                  },
+                ),
 
               // Temporary drawing preview (outer)
               if (_tool == EditorTool.drawOuter && _tempOuter.length >= 2)
@@ -2736,9 +3800,21 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 _editorEnabled ? _buildVertexEditor(_paddocks[_editingIdx!]) : const SizedBox.shrink(),
 
               // Labels above swath
-              if (pdkLabels.isNotEmpty) MarkerLayer(markers: pdkLabels, rotate: true),
+              ValueListenableBuilder<List<Marker>>(
+                valueListenable: _paddockLabelsNotifier,
+                builder: (context, pdkLabels, _) {
+                  if (pdkLabels.isEmpty) return const SizedBox.shrink();
+                  return MarkerLayer(markers: pdkLabels, rotate: true);
+                },
+              ),
 
-              if (_navLines.isNotEmpty) PolylineLayer(polylines: _navLines),
+              ValueListenableBuilder<List<Polyline>>(
+                valueListenable: _navLinesNotifier,
+                builder: (context, navLines, _) {
+                  if (navLines.isEmpty) return const SizedBox.shrink();
+                  return PolylineLayer(polylines: navLines);
+                },
+              ),
               abPreviewLayer,
               if (_navMode)
                 ValueListenableBuilder<Polyline?>(
@@ -2766,7 +3842,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
           // Editor toolbar
           _editorEnabled ? Positioned(
-            top: 12,
+            top: MediaQuery.of(context).padding.top + 12,
             left: 0,
             right: 0,
             child: Center(
@@ -2816,190 +3892,137 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             ),
           ) : const SizedBox.shrink(),
 
-          // Nav dashboard + optional guidance error HUD
+          // Nav dashboard + optional guidance error HUD (bar goes edge-to-edge under status bar)
           if (_navMode)
             Positioned(
-              top: safe.top,
+              top: 0,
               left: 0,
               right: 0,
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  _navDashboard(),
+                  ValueListenableBuilder<int>(
+                    valueListenable: _navHudTickNotifier,
+                    builder: (context, _, __) => _navDashboard(),
+                  ),
                   if (_pointA != null && _pointB != null)
-                    Center(
-                      child: _ErrorChevronHud(
-                        signedErrorM: _signedErrorM,
-                        chevronsPerSide: _chevrons,
-                        controller: _chevCtrl,
-                        rowWidthMeters: _toMeters(_width <= 0 ? 3.0 : _width),
+                    ValueListenableBuilder<double>(
+                      valueListenable: _signedErrorNotifier,
+                      builder: (context, signedErrorM, _) => Center(
+                        child: _ErrorChevronHud(
+                          signedErrorM: signedErrorM,
+                          chevronsPerSide: _chevrons,
+                          controller: _chevCtrl,
+                          rowWidthMeters: _toMeters(_width <= 0 ? 3.0 : _width),
+                        ),
                       ),
                     ),
                 ],
               ),
             ),
 
+          // Top chrome — floating circles (no AppBar strip over the map)
+          if (!_navMode) ...[
+            if (_showingHistory)
+              Positioned(
+                left: _fabEdge,
+                top: safe.top + _fabEdge,
+                child: _fatRoundActionButton(
+                  icon: Icons.arrow_back,
+                  diameter: _fabSecondaryDiameter,
+                  onPressed: _exitHistory,
+                ),
+              ),
+            Positioned(
+              right: _fabEdge,
+              top: safe.top + _fabEdge,
+              child: _fatRoundActionButton(
+                icon: Icons.menu,
+                diameter: _fabSecondaryDiameter,
+                onPressed: () => _scaffoldKey.currentState?.openEndDrawer(),
+              ),
+            ),
+          ],
+
           // Rotation toggle
           Positioned(
-            right: 12, top: safe.top + navTopInset + 12,
-            child: FloatingActionButton(
-              heroTag: 'rotateMode',
-              mini: true,
+            right: _fabEdge,
+            top: topChromeInset,
+            child: _fatRoundActionButton(
+              icon: _rotationIcon(),
+              diameter: _fabSecondaryDiameter,
               onPressed: _cycleRotationMode,
-              tooltip: 'Map rotation',
-              child: Icon(_rotationIcon()),
             ),
           ),
 
           // Follow GPS button (shown after user pans away)
           if (_showFollowGpsButton)
             Positioned(
-              right: 12, top: safe.top + navTopInset + 68,
-              child: FloatingActionButton(
-                heroTag: 'recenter',
-                mini: true,
-                tooltip: 'Follow GPS',
+              right: _fabEdge,
+              top: topChromeInset + _fabSecondaryDiameter + _fabGap,
+              child: _fatRoundActionButton(
+                icon: Icons.my_location,
+                diameter: _fabSecondaryDiameter,
                 onPressed: _recenter,
-                child: const Icon(Icons.my_location),
               ),
             ),
 
           // A/B buttons (bottom-right)
           if (_navMode && _pointA == null && _dispPos != null)
             Positioned(
-              right: 16, bottom: 16 + MediaQuery.of(context).padding.bottom,
-              child: FloatingActionButton.extended(
-                heroTag: 'markA',
+              right: _fabEdge,
+              bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
+              child: _fatRoundActionButton(
+                letter: 'A',
+                heroTag: 'primaryNavFab',
                 onPressed: _markA,
-                icon: const CircleAvatar(radius: 10, child: Text('A')),
-                label: const Text('Mark A'),
               ),
             ),
           if (_navMode && _pointA != null && _pointB == null && _dispPos != null)
             Positioned(
-              right: 16, bottom: 16 + MediaQuery.of(context).padding.bottom,
-              child: FloatingActionButton.extended(
-                heroTag: 'markB',
+              right: _fabEdge,
+              bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
+              child: _fatRoundActionButton(
+                letter: 'B',
                 onPressed: _markB,
-                icon: const CircleAvatar(radius: 10, child: Text('B')),
-                label: const Text('Mark B'),
               ),
             ),
 
-          // Finish job (round FAB – opposite A/B)
+          // Finish job
           if (_navMode)
             Positioned(
-              left: 16,
-              bottom: 16 + MediaQuery.of(context).padding.bottom,
-              child: FloatingActionButton(
-                heroTag: 'finishJob',
+              left: _fabEdge,
+              bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
+              child: _fatRoundActionButton(
+                icon: Icons.flag,
                 onPressed: _finishJob,
-                tooltip: 'Finish Job',
-                child: const Icon(Icons.flag),
               ),
             ),
 
-          // Job selection bar + paddock history button
-          if (!_navMode && !_showingHistory && _selectedIdx.isNotEmpty && _completedJobSummary == null)
+          // Pre-nav: left info rail + Start
+          if (!_navMode && !_showingHistory && _selectedIdx.isNotEmpty && _completedJobSummary == null) ...[
             Positioned(
-              left: 0, right: 0, bottom: 0,
-              child: SafeArea(
-                top: false,
-                child: Container(
-                  padding: const EdgeInsets.fromLTRB(12, 10, 12, 12),
-                  color: Colors.white.withOpacity(0.96),
-                  child: Column(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      Row(
-                        children: [
-                          Expanded(
-                            child: Text(
-                              'Job: $jobTitle',
-                              style: const TextStyle(fontWeight: FontWeight.w700),
-                              overflow: TextOverflow.ellipsis,
-                              maxLines: 1,
-                            ),
-                          ),
-                          const SizedBox(width: 8),
-                          Text(
-                            _units == 'feet'
-                                ? '${(totalHa * 2.47105).toStringAsFixed(1)} ac'
-                                : '${totalHa.toStringAsFixed(1)} ha',
-                            style: const TextStyle(fontWeight: FontWeight.w700),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 8),
-                      Material(
-                        color: Theme.of(context).colorScheme.secondaryContainer.withOpacity(0.55),
-                        borderRadius: BorderRadius.circular(8),
-                        child: InkWell(
-                          onTap: _openToolSetupDrawer,
-                          borderRadius: BorderRadius.circular(8),
-                          child: Padding(
-                            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                            child: Row(
-                              children: [
-                                Icon(
-                                  Icons.agriculture,
-                                  size: 18,
-                                  color: Theme.of(context).colorScheme.onSecondaryContainer,
-                                ),
-                                const SizedBox(width: 8),
-                                Expanded(
-                                  child: Text(
-                                    _toolQuickReferenceText(),
-                                    style: TextStyle(
-                                      fontWeight: FontWeight.w600,
-                                      fontSize: 13,
-                                      color: Theme.of(context).colorScheme.onSecondaryContainer,
-                                    ),
-                                    overflow: TextOverflow.ellipsis,
-                                  ),
-                                ),
-                                Icon(
-                                  Icons.chevron_right,
-                                  size: 20,
-                                  color: Theme.of(context).colorScheme.onSecondaryContainer,
-                                ),
-                              ],
-                            ),
-                          ),
-                        ),
-                      ),
-                      const SizedBox(height: 8),
-                      Row(
-                        children: [
-                          if (singleSelectedName != null)
-                            OutlinedButton.icon(
-                              onPressed: () => _showPaddockHistory(singleSelectedName),
-                              icon: const Icon(Icons.history),
-                              label: const Text('History'),
-                            ),
-                          const Spacer(),
-                          TextButton(
-                            onPressed: () => setState(() {
-                              _selectedIdx.clear();
-                              _suppressAutoPaddockSelect = true;
-                            }),
-                            child: const Text('Clear'),
-                          ),
-                          const SizedBox(width: 8),
-                          ElevatedButton(
-                            onPressed: _startNavigation,
-                            child: const Padding(
-                              padding: EdgeInsets.symmetric(vertical: 12),
-                              child: Text('Start Navigation'),
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
+              left: _fabEdge,
+              bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
+              child: _jobSideRail(
+                paddockLabel: _selectedIdx.length == 1
+                    ? selectedNames.first
+                    : '${_selectedIdx.length} paddocks',
+                toolLabel: _toolQuickReferenceText(),
+                areaLabel: _areaText(totalHa),
+                historyPaddockName: singleSelectedName,
               ),
             ),
+            Positioned(
+              right: _fabEdge,
+              bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
+              child: _fatRoundActionButton(
+                icon: Icons.play_arrow_rounded,
+                heroTag: 'primaryNavFab',
+                onPressed: _startNavigation,
+              ),
+            ),
+          ],
 
           // Completed job summary (top — keeps bottom controls clear)
           if (_completedJobSummary != null && !_navMode && !_showingHistory)
@@ -3015,6 +4038,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               child: _historyJobPanel(),
             ),
         ],
+      ),
       ),
     );
   }
@@ -3151,11 +4175,22 @@ class _HistoryJobPanelState extends State<_HistoryJobPanel> with TickerProviderS
   }
 
   Widget _historyStat(String label, String value) {
+    final scheme = Theme.of(context).colorScheme;
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Text(label, style: const TextStyle(fontSize: 11, color: Colors.black45)),
-        Text(value, style: const TextStyle(fontWeight: FontWeight.w600, fontSize: 13)),
+        Text(
+          label,
+          style: TextStyle(fontSize: 11, color: scheme.onSurfaceVariant),
+        ),
+        Text(
+          value,
+          style: TextStyle(
+            fontWeight: FontWeight.w600,
+            fontSize: 13,
+            color: scheme.onSurface,
+          ),
+        ),
       ],
     );
   }
@@ -3163,9 +4198,11 @@ class _HistoryJobPanelState extends State<_HistoryJobPanel> with TickerProviderS
   @override
   Widget build(BuildContext context) {
     final jobs = widget.jobs;
+    final scheme = Theme.of(context).colorScheme;
 
     return Material(
       elevation: 8,
+      color: scheme.surface,
       borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
       child: SafeArea(
         top: false,
@@ -3188,9 +4225,22 @@ class _HistoryJobPanelState extends State<_HistoryJobPanel> with TickerProviderS
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.start,
                       children: [
-                        Text(_paddockTabLabel(j), style: const TextStyle(fontWeight: FontWeight.w700, fontSize: 15)),
+                        Text(
+                          _paddockTabLabel(j),
+                          style: TextStyle(
+                            fontWeight: FontWeight.w700,
+                            fontSize: 15,
+                            color: scheme.onSurface,
+                          ),
+                        ),
                         const SizedBox(height: 4),
-                        Text(j.id, style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                        Text(
+                          j.id,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: scheme.onSurfaceVariant,
+                          ),
+                        ),
                         const SizedBox(height: 4),
                         Wrap(
                           spacing: 12,
@@ -3205,7 +4255,10 @@ class _HistoryJobPanelState extends State<_HistoryJobPanel> with TickerProviderS
                         const SizedBox(height: 4),
                         Text(
                           '${widget.formatDayHeader(DateTime(j.startedAt.year, j.startedAt.month, j.startedAt.day))}  ${widget.formatTime(j.startedAt)} – ${widget.formatTime(j.endedAt)}  •  ${j.avgSpeedKph.toStringAsFixed(1)} km/h',
-                          style: const TextStyle(fontSize: 12, color: Colors.black54),
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: scheme.onSurfaceVariant,
+                          ),
                         ),
                       ],
                     ),

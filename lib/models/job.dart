@@ -1,6 +1,113 @@
 import 'package:latlong2/latlong.dart';
 import '../services/geometry.dart';
 
+/// Lightweight job record for history lists (no GPS path).
+class JobFileSummary {
+  final String filePath;
+  final String id;
+  final DateTime startedAt;
+  final DateTime endedAt;
+  final List<String> paddockNames;
+  final double totalHa;
+  final double avgSpeedKph;
+  final double? swathWidthM;
+  final double pathDistanceM;
+  final double? swathWidthSetting;
+  final String? unitsAtSave;
+  final bool hasSavedSwathWidth;
+
+  const JobFileSummary({
+    required this.filePath,
+    required this.id,
+    required this.startedAt,
+    required this.endedAt,
+    required this.paddockNames,
+    required this.totalHa,
+    required this.avgSpeedKph,
+    this.swathWidthM,
+    this.pathDistanceM = 0,
+    this.swathWidthSetting,
+    this.unitsAtSave,
+    this.hasSavedSwathWidth = false,
+  });
+
+  factory JobFileSummary.fromSavedJob(SavedJob job, String filePath) {
+    return JobFileSummary(
+      filePath: filePath,
+      id: job.id,
+      startedAt: job.startedAt,
+      endedAt: job.endedAt,
+      paddockNames: List<String>.from(job.paddockNames),
+      totalHa: job.totalHa,
+      avgSpeedKph: job.avgSpeedKph,
+      swathWidthM: job.swathWidthM,
+      pathDistanceM: job.pathDistanceM,
+      swathWidthSetting: job.swathWidthSetting,
+      unitsAtSave: job.unitsAtSave,
+      hasSavedSwathWidth: job.hasSavedSwathWidth,
+    );
+  }
+
+  factory JobFileSummary.fromJson(String filePath, Map<String, dynamic> j) {
+    final hasSaved = j['hasSavedSwathWidth'] == true ||
+        j['swathWidthSetting'] != null;
+    return JobFileSummary(
+      filePath: filePath,
+      id: j['id'] as String,
+      startedAt: DateTime.parse(j['startedAt'] as String),
+      endedAt: DateTime.parse(j['endedAt'] as String),
+      paddockNames: (j['paddockNames'] as List).map((e) => e.toString()).toList(),
+      totalHa: (j['totalHa'] as num).toDouble(),
+      avgSpeedKph: (j['avgSpeedKph'] as num).toDouble(),
+      swathWidthM: (j['swathWidthM'] as num?)?.toDouble(),
+      pathDistanceM: (j['pathDistanceM'] as num?)?.toDouble() ?? 0,
+      swathWidthSetting: (j['swathWidthSetting'] as num?)?.toDouble(),
+      unitsAtSave: j['unitsAtSave'] as String?,
+      hasSavedSwathWidth: hasSaved,
+    );
+  }
+
+  Map<String, dynamic> toJson() => {
+    'id': id,
+    'startedAt': startedAt.toIso8601String(),
+    'endedAt': endedAt.toIso8601String(),
+    'paddockNames': paddockNames,
+    'totalHa': totalHa,
+    'avgSpeedKph': avgSpeedKph,
+    'swathWidthM': swathWidthM,
+    'pathDistanceM': pathDistanceM,
+    'swathWidthSetting': swathWidthSetting,
+    'unitsAtSave': unitsAtSave,
+    'hasSavedSwathWidth': hasSavedSwathWidth,
+  };
+
+  double? get storedSwathWidthM {
+    if (swathWidthM != null && swathWidthM! > 0) return swathWidthM;
+    if (swathWidthSetting != null && swathWidthSetting! > 0) {
+      return unitsAtSave == 'feet'
+          ? swathWidthSetting! / 3.280839895
+          : swathWidthSetting!;
+    }
+    return null;
+  }
+
+  double resolveSwathWidthM(double fallbackSwathWidthM) {
+    if (hasSavedSwathWidth) {
+      return storedSwathWidthM ?? fallbackSwathWidthM;
+    }
+    return fallbackSwathWidthM;
+  }
+
+  double areaAppliedHaFor(double fallbackSwathWidthM) =>
+      pathDistanceM * resolveSwathWidthM(fallbackSwathWidthM) / 10000.0;
+
+  double coveragePercentFor(double fallbackSwathWidthM) {
+    if (totalHa <= 0) return 0;
+    return (areaAppliedHaFor(fallbackSwathWidthM) / totalHa * 100)
+        .clamp(0, double.infinity);
+  }
+}
+
 class SavedJob {
   final String id;                 // "17/08/25 Job 1"
   final DateTime startedAt;
