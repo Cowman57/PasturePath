@@ -61,17 +61,9 @@ class UsbDeviceInfo {
 
 /// Reads NMEA over an Android USB-serial adapter (e.g. Quescan M9).
 class UsbSerialGpsSource implements GpsSource {
-  UsbSerialGpsSource({
-    this.baudRate = 115200,
-    this.preferredDeviceId,
-    this.preferredVid,
-    this.preferredPid,
-  });
+  UsbSerialGpsSource({this.baudRate = 115200});
 
   int baudRate;
-  int? preferredDeviceId;
-  int? preferredVid;
-  int? preferredPid;
 
   final NmeaParser _parser = NmeaParser();
   final List<int> _buf = <int>[];
@@ -165,7 +157,7 @@ class UsbSerialGpsSource implements GpsSource {
       throw StateError('No USB serial GPS connected');
     }
 
-    final device = _pickDevice(devices);
+    final device = devices.first;
     final info = UsbDeviceInfo.fromUsb(device);
     connectedVidPid = info.vidPidLabel;
 
@@ -207,23 +199,6 @@ class UsbSerialGpsSource implements GpsSource {
       },
       cancelOnError: false,
     );
-  }
-
-  UsbDevice _pickDevice(List<UsbDevice> devices) {
-    final prefVid = preferredVid;
-    final prefPid = preferredPid;
-    if (prefVid != null && prefPid != null) {
-      for (final d in devices) {
-        if (d.vid == prefVid && d.pid == prefPid) return d;
-      }
-    }
-    final prefId = preferredDeviceId;
-    if (prefId != null) {
-      for (final d in devices) {
-        if (d.deviceId == prefId) return d;
-      }
-    }
-    return devices.first;
   }
 
   Future<({UsbPort port, String driverType})?> _openPort(UsbDevice device) async {

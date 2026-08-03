@@ -26,7 +26,6 @@ import '../../services/geojson_parser.dart';
 import '../../services/gps_display_smoother.dart';
 import '../../services/gps/gps_input_controller.dart';
 import '../../services/gps/gps_source.dart';
-import '../../services/gps/usb_serial_gps_source.dart';
 import '../../services/implement_kinematics.dart';
 import '../../models/tool_setup_dimensions.dart';
 import '../../services/tool_preset_store.dart';
@@ -129,7 +128,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   static const double _guidanceMaxSpanCapM = 500.0;
   static const double _guidanceAlongTrackMargin = 1.5;
   static const int _navLogicIntervalMs = 200;
-  static const double _cameraMoveThresholdM = 1.5;
+  static const double _cameraMoveThresholdM = 0.35;
   static const double _cameraRotateThresholdDeg = 1.0;
   static const int _guidanceScanRadius = 3;
   int _lastNavLogicMs = 0;
@@ -161,15 +160,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   /// Boom points already polygonised into [_committedSwathPolys].
   int _swathCommittedBoomLen = 0;
   int _lastSwathCommitMs = 0;
-  static const double _minGpsRecordM = 1.0;
+  static const double _minGpsRecordM = 0.45;
   static const double _maxGpsJumpM = 35.0;
   static const double _minMovingSpeedMps = 0.4;
   /// Stronger simplify on save keeps job files smaller for history / map show.
   static const double _jobSaveSimplifyMinDistM = 1.25;
-  static const int _swathDisplaySimplifyAfter = 80;
-  static const double _swathDisplaySimplifyMinDistM = 0.85;
-  static const int _swathCommitIntervalMs = 200; // ~5 Hz max
-  static const double _swathCommitMinAdvanceM = 4.0;
+  /// Display rebuild: keep continuous rings (no chunk seams). Throttle for lag.
+  static const double _swathDisplaySimplifyMinDistM = 0.55;
+  static const int _swathCommitIntervalMs = 400;
+  static const double _swathCommitMinAdvanceM = 2.0;
   // ====== Paddock Editor ======
   EditorTool _tool = EditorTool.none;
 
@@ -264,7 +263,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   Future<void> _loadPrefs() async {
     final p = await SharedPreferences.getInstance();
     final gpsMode = GpsInputModeX.fromPrefs(p.getString('gpsInputMode'));
-    final gpsBaud = p.getInt('gpsBaudRate') ?? GpsInputController.defaultBaudRate;
     setState(() {
       _units = p.getString('units') ?? 'meters';
       _toolDims = ToolSetupDimensions(
@@ -283,13 +281,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _selectedToolPresetName =
           (presetName != null && presetName.isNotEmpty) ? presetName : null;
     });
-    await _gpsInput.setBaudRate(gpsBaud);
     await _gpsInput.setMode(gpsMode);
-    final prefVid = p.getInt('gpsPreferredVid');
-    final prefPid = p.getInt('gpsPreferredPid');
-    if (prefVid != null && prefPid != null) {
-      _gpsInput.restorePreferredVidPid(prefVid, prefPid);
-    }
   }
 
   Future<void> _writePrefsToDisk() async {
@@ -305,16 +297,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     await p.setString(ThemeController.prefsKey, ThemeController.toPrefs(widget.themeController.mode));
     await p.setDouble('gpsSmoothness', _gpsSmoothness);
     await p.setString('gpsInputMode', _gpsInput.mode.prefsValue);
-    await p.setInt('gpsBaudRate', _gpsInput.baudRate);
-    final prefVid = _gpsInput.preferredVid;
-    final prefPid = _gpsInput.preferredPid;
-    if (prefVid != null && prefPid != null) {
-      await p.setInt('gpsPreferredVid', prefVid);
-      await p.setInt('gpsPreferredPid', prefPid);
-    } else {
-      await p.remove('gpsPreferredVid');
-      await p.remove('gpsPreferredPid');
-    }
     if (_selectedToolPresetName != null && _selectedToolPresetName!.isNotEmpty) {
       await p.setString('selectedToolPresetName', _selectedToolPresetName!);
     } else {
@@ -334,9 +316,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     ThemeController.prefsKey: ThemeController.toPrefs(widget.themeController.mode),
     'gpsSmoothness': _gpsSmoothness,
     'gpsInputMode': _gpsInput.mode.prefsValue,
-    'gpsBaudRate': _gpsInput.baudRate,
-    if (_gpsInput.preferredVid != null) 'gpsPreferredVid': _gpsInput.preferredVid,
-    if (_gpsInput.preferredPid != null) 'gpsPreferredPid': _gpsInput.preferredPid,
     if (_selectedToolPresetName != null) 'selectedToolPresetName': _selectedToolPresetName,
   };
 
@@ -690,9 +669,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
     if (_followGps && !_showingHistory) {
       final last = _lastCameraTarget;
+      // In nav, keep the camera glued to GPS; looser threshold only when browsing.
+      final threshold = _navMode ? 0.15 : _cameraMoveThresholdM;
       final needMove = last == null ||
-          const Distance().as(LengthUnit.Meter, last, _dispPos!) >=
-              _cameraMoveThresholdM;
+          const Distance().as(LengthUnit.Meter, last, _dispPos!) >= threshold;
       if (needMove) {
         _mapController.move(_dispPos!, _mapController.camera.zoom);
         _lastCameraTarget = _dispPos;
@@ -727,7 +707,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   String _gpsRailLabel() {
     switch (_gpsInput.activeSource) {
       case GpsActiveSource.usb:
-        return 'USB · ${_gpsInput.baudRate}';
+        return 'USB';
       case GpsActiveSource.device:
         return 'Device';
       case GpsActiveSource.none:
@@ -1490,37 +1470,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     );
   }
 
-  List<LatLng> _boomPathForDisplay(List<LatLng> boom) {
-    if (boom.length < 2) return [];
-    if (boom.length > _swathDisplaySimplifyAfter) {
-      return simplifySwathPath(boom, minDistM: _swathDisplaySimplifyMinDistM);
-    }
-    return boom;
-  }
-
-  /// Live tip only — last few boom points + current tip (cheap).
-  void _syncLiveSwathTip() {
-    if (!_navMode) {
-      _swathLiveNotifier.value = null;
-      return;
-    }
-    final tipPath = _liveBoomTipPath();
-    if (tipPath.length < 2) {
-      _swathLiveNotifier.value = null;
-      return;
-    }
-    final rings = buildSwathRingsFromPath(tipPath, _currentSwathWidthM());
-    if (rings.isEmpty) {
-      _swathLiveNotifier.value = null;
-      return;
-    }
-    _swathLiveNotifier.value = _swathPolygonFromRing(rings.last);
-  }
-
   List<LatLng> _liveBoomTipPath() {
     final boom = _jobPath;
     if (boom.isEmpty) return const [];
-    final start = boom.length > 4 ? boom.length - 4 : 0;
+    // Short tip only — committed display already covers boom[0..committed).
+    final start = boom.length > 3 ? boom.length - 3 : 0;
     final tip = List<LatLng>.from(boom.sublist(start));
     final live = _liveGpsForSwathTip();
     final bearing = _pathTravelBearingDeg();
@@ -1534,7 +1488,22 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     return tip;
   }
 
-  /// Append new swath rings for boom advance; throttled / min-advance gated.
+  void _syncLiveSwathTip() {
+    if (!_navMode) {
+      _swathLiveNotifier.value = null;
+      return;
+    }
+    final tipPath = _liveBoomTipPath();
+    if (tipPath.length < 2) {
+      _swathLiveNotifier.value = null;
+      return;
+    }
+    final ring = buildSwathRingFromPath(tipPath, _currentSwathWidthM());
+    _swathLiveNotifier.value = _swathPolygonFromRing(ring);
+  }
+
+  /// Rebuild continuous swath polygons from the boom path (throttled).
+  /// Chunked append left hairline gaps at every join; one ring set stays filled.
   void _maybeCommitSwath({bool force = false}) {
     if (!_navMode) return;
     final boom = _jobPath;
@@ -1543,40 +1512,31 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final ms = DateTime.now().millisecondsSinceEpoch;
     if (!force && ms - _lastSwathCommitMs < _swathCommitIntervalMs) return;
 
-    final start = _swathCommittedBoomLen > 0 ? _swathCommittedBoomLen - 1 : 0;
-    if (boom.length - start < 2) return;
-
-    var advanceM = 0.0;
-    for (int i = start + 1; i < boom.length; i++) {
-      advanceM += const Distance().as(LengthUnit.Meter, boom[i - 1], boom[i]);
-    }
-    final newPts = boom.length - _swathCommittedBoomLen;
-    if (!force &&
-        advanceM < _swathCommitMinAdvanceM &&
-        newPts < 4) {
-      return;
+    if (!force && _swathCommittedBoomLen > 0) {
+      var advanceM = 0.0;
+      final from = _swathCommittedBoomLen.clamp(1, boom.length);
+      for (int i = from; i < boom.length; i++) {
+        advanceM += const Distance().as(LengthUnit.Meter, boom[i - 1], boom[i]);
+      }
+      final newPts = boom.length - _swathCommittedBoomLen;
+      if (advanceM < _swathCommitMinAdvanceM && newPts < 4) return;
     }
 
     _lastSwathCommitMs = ms;
-    var segment = boom.sublist(start);
-    segment = _boomPathForDisplay(segment);
-    if (segment.length < 2) {
-      _swathCommittedBoomLen = boom.length;
-      return;
-    }
+    _swathCommittedBoomLen = boom.length;
 
-    final rings = buildSwathRingsFromPath(segment, _currentSwathWidthM());
-    var added = false;
+    final displayPath = boom.length > 24
+        ? simplifySwathPath(boom, minDistM: _swathDisplaySimplifyMinDistM)
+        : List<LatLng>.from(boom);
+    if (displayPath.length < 2) return;
+
+    final rings = buildSwathRingsFromPath(displayPath, _currentSwathWidthM());
+    _committedSwathPolys.clear();
     for (final ring in rings) {
       final poly = _swathPolygonFromRing(ring);
-      if (poly == null) continue;
-      _committedSwathPolys.add(poly);
-      added = true;
+      if (poly != null) _committedSwathPolys.add(poly);
     }
-    _swathCommittedBoomLen = boom.length;
-    if (added || force) {
-      _swathCommittedNotifier.value = List<Polygon>.from(_committedSwathPolys);
-    }
+    _swathCommittedNotifier.value = List<Polygon>.from(_committedSwathPolys);
   }
 
   void _syncSwathDisplay({bool forceCommit = false}) {
@@ -2683,88 +2643,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             },
           ),
         ),
-        if (_gpsInput.mode != GpsInputMode.device) ...[
-          const SizedBox(height: 8),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: DropdownButtonFormField<int>(
-              value: _gpsInput.baudRate,
-              decoration: const InputDecoration(
-                labelText: 'Baud rate',
-                border: OutlineInputBorder(),
-                isDense: true,
-              ),
-              items: const [
-                DropdownMenuItem(value: 9600, child: Text('9600')),
-                DropdownMenuItem(value: 38400, child: Text('38400')),
-                DropdownMenuItem(value: 57600, child: Text('57600')),
-                DropdownMenuItem(value: 115200, child: Text('115200')),
-                DropdownMenuItem(value: 230400, child: Text('230400')),
-              ],
-              onChanged: (v) async {
-                if (v == null) return;
-                await _gpsInput.setBaudRate(v);
-                await _savePrefs();
-              },
-            ),
-          ),
-          if (_gpsInput.devices.isNotEmpty) ...[
-            const SizedBox(height: 8),
-            Padding(
-              padding: const EdgeInsets.symmetric(horizontal: 16),
-              child: DropdownButtonFormField<String?>(
-                isExpanded: true,
-                value: () {
-                  final vid = _gpsInput.preferredVid;
-                  final pid = _gpsInput.preferredPid;
-                  if (vid != null && pid != null) return '$vid:$pid';
-                  if (_gpsInput.devices.length == 1) {
-                    return _gpsInput.devices.first.stableKey;
-                  }
-                  return null;
-                }(),
-                decoration: const InputDecoration(
-                  labelText: 'USB device',
-                  border: OutlineInputBorder(),
-                  isDense: true,
-                ),
-                items: [
-                  const DropdownMenuItem<String?>(
-                    value: null,
-                    child: Text(
-                      'Auto (first device)',
-                      overflow: TextOverflow.ellipsis,
-                    ),
-                  ),
-                  ..._gpsInput.devices.map(
-                    (d) => DropdownMenuItem<String?>(
-                      value: d.stableKey ?? 'id:${d.deviceId}',
-                      child: Text(
-                        '${d.displayName} (${d.vidPidLabel})',
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                      ),
-                    ),
-                  ),
-                ],
-                onChanged: (key) async {
-                  if (key == null) {
-                    await _gpsInput.setPreferredDevice(null);
-                  } else {
-                    UsbDeviceInfo? match;
-                    for (final d in _gpsInput.devices) {
-                      if (d.stableKey == key || 'id:${d.deviceId}' == key) {
-                        match = d;
-                        break;
-                      }
-                    }
-                    await _gpsInput.setPreferredDevice(match);
-                  }
-                  await _savePrefs();
-                },
-              ),
-            ),
-          ],
+        if (_gpsInput.mode != GpsInputMode.device)
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 0),
             child: Text(
@@ -2775,7 +2654,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               ),
             ),
           ),
-        ],
         ListTile(
           title: Text(_gpsInput.statusMessage),
           subtitle: Text(_gpsQualitySubtitle()),

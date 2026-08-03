@@ -10,17 +10,12 @@ import 'usb_serial_gps_source.dart';
 
 /// Selects and runs the active GPS source; exposes a single [fixes] stream.
 class GpsInputController extends ChangeNotifier {
-  GpsInputController({
-    GpsInputMode mode = GpsInputMode.auto,
-    int baudRate = 115200,
-  })  : _mode = mode,
-        _baudRate = baudRate;
+  GpsInputController({GpsInputMode mode = GpsInputMode.auto}) : _mode = mode;
 
   static const int defaultBaudRate = 115200;
   static const Duration _usbEventDebounce = Duration(milliseconds: 450);
 
   GpsInputMode _mode;
-  int _baudRate;
   GpsActiveSource _active = GpsActiveSource.none;
   String _statusMessage = 'Starting…';
   String? _deviceLabel;
@@ -51,12 +46,8 @@ class GpsInputController extends ChangeNotifier {
   bool _switching = false;
   bool _pendingApply = false;
   List<UsbDeviceInfo> _devices = const [];
-  int? _preferredDeviceId;
-  int? _preferredVid;
-  int? _preferredPid;
 
   GpsInputMode get mode => _mode;
-  int get baudRate => _baudRate;
   GpsActiveSource get activeSource => _active;
   String get statusMessage => _statusMessage;
   String? get deviceLabel => _deviceLabel;
@@ -67,9 +58,6 @@ class GpsInputController extends ChangeNotifier {
   int? get satellites => _satellites;
   double? get accuracyM => _accuracyM;
   double get fixHz => _fixHz;
-  int? get preferredDeviceId => _preferredDeviceId;
-  int? get preferredVid => _preferredVid;
-  int? get preferredPid => _preferredPid;
   List<UsbDeviceInfo> get devices => _devices;
   Stream<GpsFix> get fixes => _fixesController.stream;
 
@@ -93,79 +81,8 @@ class GpsInputController extends ChangeNotifier {
     if (_started) await _applySelection(reason: 'mode');
   }
 
-  Future<void> setBaudRate(int baud) async {
-    if (baud <= 0 || _baudRate == baud) return;
-    _baudRate = baud;
-    notifyListeners();
-    if (_started && (_mode == GpsInputMode.usb || _mode == GpsInputMode.auto)) {
-      await _applySelection(reason: 'baud');
-    }
-  }
-
-  Future<void> setPreferredDevice(UsbDeviceInfo? device) async {
-    final nextId = device?.deviceId;
-    final nextVid = device?.vid;
-    final nextPid = device?.pid;
-    if (_preferredDeviceId == nextId &&
-        _preferredVid == nextVid &&
-        _preferredPid == nextPid) {
-      return;
-    }
-    _preferredDeviceId = nextId;
-    _preferredVid = nextVid;
-    _preferredPid = nextPid;
-    notifyListeners();
-    if (_started && (_mode == GpsInputMode.usb || _mode == GpsInputMode.auto)) {
-      await _applySelection(reason: 'device');
-    }
-  }
-
-  /// Restore a preferred dongle by VID:PID after app restart.
-  void restorePreferredVidPid(int? vid, int? pid) {
-    _preferredVid = vid;
-    _preferredPid = pid;
-    if (vid != null && pid != null) {
-      for (final d in _devices) {
-        if (d.vid == vid && d.pid == pid) {
-          _preferredDeviceId = d.deviceId;
-          break;
-        }
-      }
-    }
-  }
-
-  Future<void> setPreferredDeviceId(int? deviceId) async {
-    if (deviceId == null) {
-      await setPreferredDevice(null);
-      return;
-    }
-    UsbDeviceInfo? match;
-    for (final d in _devices) {
-      if (d.deviceId == deviceId) {
-        match = d;
-        break;
-      }
-    }
-    await setPreferredDevice(
-      match ?? UsbDeviceInfo(deviceId: deviceId, deviceName: 'USB'),
-    );
-  }
-
   Future<void> refreshDevices() async {
     _devices = await UsbSerialGpsSource.listDevices();
-    if (_preferredVid != null && _preferredPid != null) {
-      for (final d in _devices) {
-        if (d.vid == _preferredVid && d.pid == _preferredPid) {
-          _preferredDeviceId = d.deviceId;
-          notifyListeners();
-          return;
-        }
-      }
-    }
-    if (_preferredDeviceId != null &&
-        !_devices.any((d) => d.deviceId == _preferredDeviceId)) {
-      _preferredDeviceId = null;
-    }
     notifyListeners();
   }
 
@@ -243,12 +160,7 @@ class GpsInputController extends ChangeNotifier {
     }
 
     await _stopActiveSource();
-    final src = UsbSerialGpsSource(
-      baudRate: _baudRate,
-      preferredDeviceId: _preferredDeviceId,
-      preferredVid: _preferredVid,
-      preferredPid: _preferredPid,
-    );
+    final src = UsbSerialGpsSource(baudRate: defaultBaudRate);
     try {
       await src.start();
       _usb = src;
@@ -258,8 +170,8 @@ class GpsInputController extends ChangeNotifier {
       final driver = src.openedDriverType ?? 'auto';
       final vidPid = src.connectedVidPid ?? '';
       _statusMessage =
-          'USB connected · $_deviceLabel · $_baudRate baud · $driver'
-          '${vidPid.isEmpty ? '' : ' · $vidPid'}';
+          'USB connected · $_deviceLabel'
+          '${vidPid.isEmpty ? '' : ' · $vidPid'} · $driver';
       _connectionHint = 'Waiting for fix…';
       _resetQuality();
       _listenSource(src.fixes);
@@ -366,7 +278,7 @@ class GpsInputController extends ChangeNotifier {
         } else if (src.bytesReceived <= 0) {
           nextHint = 'No serial data — close GPS Connector if stuck';
         } else if (src.nmeaLines <= 0) {
-          nextHint = 'Receiving bytes, waiting for NMEA (check baud)';
+          nextHint = 'Receiving bytes, waiting for NMEA';
         } else if (src.fixCount <= 0) {
           nextHint = src.lastRejectReason ??
               'NMEA received, waiting for satellite lock';
