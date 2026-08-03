@@ -11,7 +11,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/scheduler.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_map/flutter_map.dart';
-import 'package:flutter_map_dragmarker/flutter_map_dragmarker.dart';
 import 'package:latlong2/latlong.dart';
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -32,8 +31,8 @@ import '../../services/tool_preset_store.dart';
 import '../../widgets/navigation_arrow_icon.dart';
 import 'tool_setup_tab.dart';
 
-
-enum EditorTool { none, drawOuter, drawHole, edit }
+/// Paddock editor sub-state while [_MapScreenState._editorMode] is true.
+enum EditorTool { browse, drawOuter, drawHole, edit }
 
 
 
@@ -49,7 +48,7 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
-  bool _editorEnabled = false;
+  bool _editorMode = false;
   final MapController _mapController = MapController();
   final GlobalKey<ScaffoldState> _scaffoldKey = GlobalKey<ScaffoldState>();
 
@@ -160,6 +159,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   /// Boom points already polygonised into [_committedSwathPolys].
   int _swathCommittedBoomLen = 0;
   int _lastSwathCommitMs = 0;
+  /// USB NMEA emits RMC+GGA(+GLL) per epoch — only sample once per ~25 Hz slot.
+  int? _lastSwathRecordBucket;
+  int? _lastSpeedSampleBucket;
+  static const int _navSampleBucketMs = 40;
   static const double _minGpsRecordM = 0.45;
   static const double _maxGpsJumpM = 35.0;
   static const double _minMovingSpeedMps = 0.4;
@@ -170,19 +173,38 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   static const int _swathCommitIntervalMs = 400;
   static const double _swathCommitMinAdvanceM = 2.0;
   // ====== Paddock Editor ======
-  EditorTool _tool = EditorTool.none;
+  EditorTool _tool = EditorTool.browse;
 
-  // drawing a new paddock (outer ring)
+  /// Outer ring while creating a new paddock.
   final List<LatLng> _tempOuter = [];
-  // drawing a new hole for an existing paddock
+  /// Hole ring while drawing a hole on [_editingIdx].
   final List<LatLng> _tempHole = [];
+  /// Name chosen when starting a new paddock (+).
+  String? _draftPaddockName;
 
-  // current paddock selected for editing / hole insertion
+  /// Paddock index being edited.
   int? _editingIdx;
+  /// Selected vertex index (outer or hole).
+  int? _selectedVertexIdx;
+  /// Null = outer ring; otherwise hole index in [_editingIdx].
+  int? _selectedHoleIdx;
+  /// Selected vertex sticks to map center while panning.
+  bool _vertexLiveMove = false;
+  /// Ignore live-move while programmatically centering on a vertex.
+  bool _suppressVertexLiveMove = false;
 
-  // snap & hit settings
-  static const double _snapMeters = 8;   // threshold to snap-close polygon
-  static const double _hitMeters  = 150; // centroid pick radius
+  void _clearVertexSelection({bool persist = false}) {
+    if (persist &&
+        _vertexLiveMove &&
+        _editingIdx != null &&
+        _selectedVertexIdx != null) {
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+    }
+    _selectedVertexIdx = null;
+    _selectedHoleIdx = null;
+    _vertexLiveMove = false;
+    _suppressVertexLiveMove = false;
+  }
 
   void _undoLastPoint() {
     if (_tool == EditorTool.drawOuter && _tempOuter.isNotEmpty) {
@@ -190,6 +212,308 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     } else if (_tool == EditorTool.drawHole && _tempHole.isNotEmpty) {
       setState(() => _tempHole.removeLast());
     }
+  }
+
+  LatLng _mapCenterLatLng() => _mapController.camera.center;
+
+  void _enterEditorMode() {
+    setState(() {
+      _editorMode = true;
+      _tool = EditorTool.browse;
+      _tempOuter.clear();
+      _tempHole.clear();
+      _draftPaddockName = null;
+      _editingIdx = null;
+      _clearVertexSelection();
+      _navMode = false;
+      _followGps = false;
+      if (_showingHistory) {
+        _showingHistory = false;
+        _activeHistoryJobs = [];
+        _historySwathPolys.clear();
+        _historyPathPolylines.clear();
+      }
+    });
+    _rebuildPaddockLayers();
+  }
+
+  void _exitEditorMode() {
+    if (_vertexLiveMove) {
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+    }
+    setState(() {
+      _editorMode = false;
+      _tool = EditorTool.browse;
+      _tempOuter.clear();
+      _tempHole.clear();
+      _draftPaddockName = null;
+      _editingIdx = null;
+      _clearVertexSelection();
+    });
+    _rebuildPaddockLayers();
+  }
+
+  /// Done: edit/draw → browse; browse → exit editor.
+  void _editorDone() {
+    if (!_editorMode) return;
+    if (_tool == EditorTool.browse) {
+      _exitEditorMode();
+      return;
+    }
+    if (_vertexLiveMove) {
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+    }
+    if (_tool == EditorTool.drawHole) {
+      setState(() {
+        _tool = EditorTool.edit;
+        _tempHole.clear();
+        _clearVertexSelection();
+      });
+      _rebuildPaddockLayers();
+      return;
+    }
+    setState(() {
+      _tool = EditorTool.browse;
+      _tempOuter.clear();
+      _tempHole.clear();
+      _draftPaddockName = null;
+      _editingIdx = null;
+      _clearVertexSelection();
+    });
+    _rebuildPaddockLayers();
+  }
+
+  Future<void> _startNewPaddock() async {
+    if (!_editorMode) return;
+    final name = await _promptName(context);
+    if (name == null || name.isEmpty) return;
+    setState(() {
+      _tool = EditorTool.drawOuter;
+      _draftPaddockName = name;
+      _tempOuter.clear();
+      _tempHole.clear();
+      _editingIdx = null;
+      _clearVertexSelection();
+      _selectedIdx.clear();
+    });
+    _rebuildPaddockLayers();
+  }
+
+  void _startDrawHole() {
+    if (!_editorMode || _editingIdx == null) return;
+    if (_vertexLiveMove) {
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+    }
+    setState(() {
+      _tool = EditorTool.drawHole;
+      _tempHole.clear();
+      _clearVertexSelection();
+    });
+  }
+
+  void _selectPaddockForEdit(int idx) {
+    if (_vertexLiveMove) {
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+    }
+    setState(() {
+      _tool = EditorTool.edit;
+      _editingIdx = idx;
+      _clearVertexSelection();
+      _tempOuter.clear();
+      _tempHole.clear();
+      _draftPaddockName = null;
+      _selectedIdx
+        ..clear()
+        ..add(idx);
+    });
+    _rebuildPaddockLayers();
+  }
+
+  List<LatLng>? _selectedRing() {
+    if (_editingIdx == null || _selectedVertexIdx == null) return null;
+    final p = _paddocks[_editingIdx!];
+    if (_selectedHoleIdx == null) return p.outer;
+    if (_selectedHoleIdx! < 0 || _selectedHoleIdx! >= p.holes.length) {
+      return null;
+    }
+    return p.holes[_selectedHoleIdx!];
+  }
+
+  void _selectVertex({required int? holeIdx, required int vertexIdx}) {
+    if (!_editorMode ||
+        _tool != EditorTool.edit ||
+        _editingIdx == null ||
+        !_mapReady) {
+      return;
+    }
+    if (_vertexLiveMove &&
+        (_selectedHoleIdx != holeIdx || _selectedVertexIdx != vertexIdx)) {
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+    }
+    final p = _paddocks[_editingIdx!];
+    final ring = holeIdx == null ? p.outer : p.holes[holeIdx];
+    if (vertexIdx < 0 || vertexIdx >= ring.length) return;
+
+    setState(() {
+      _selectedHoleIdx = holeIdx;
+      _selectedVertexIdx = vertexIdx;
+      _vertexLiveMove = true;
+      _suppressVertexLiveMove = true;
+    });
+
+    final target = ring[vertexIdx];
+    _mapController.move(target, _mapController.camera.zoom);
+    _runAfterMapFrame(() {
+      if (!mounted) return;
+      _suppressVertexLiveMove = false;
+      _snapSelectedVertexToCenter(persist: false);
+    });
+  }
+
+  void _snapSelectedVertexToCenter({required bool persist}) {
+    if (!_editorMode ||
+        !_vertexLiveMove ||
+        _editingIdx == null ||
+        _selectedVertexIdx == null) {
+      return;
+    }
+    final ring = _selectedRing();
+    if (ring == null) return;
+    final i = _selectedVertexIdx!;
+    if (i < 0 || i >= ring.length) return;
+    final center = _mapCenterLatLng();
+    ring[i] = center;
+    _recalcPaddock(_editingIdx!);
+    if (persist) {
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+    }
+    if (mounted) setState(() {});
+  }
+
+  void _addVertexAtCrosshair() {
+    if (!_editorMode || !_mapReady) return;
+    final ll = _mapCenterLatLng();
+    if (_tool == EditorTool.drawOuter) {
+      setState(() => _tempOuter.add(ll));
+      return;
+    }
+    if (_tool == EditorTool.drawHole) {
+      setState(() => _tempHole.add(ll));
+      return;
+    }
+    if (_tool == EditorTool.edit && _editingIdx != null) {
+      if (_vertexLiveMove) {
+        _persistFarmJson(_buildFarmGeoJsonBytes());
+      }
+      // Insert on the ring currently focused (selected hole, else outer).
+      final p = _paddocks[_editingIdx!];
+      final holeIdx = _selectedHoleIdx;
+      final ring = holeIdx == null ? p.outer : p.holes[holeIdx];
+      late final int insertAt;
+      if (ring.length < 2) {
+        insertAt = ring.length;
+        ring.add(ll);
+      } else {
+        insertAt = _nearestEdgeInsertIndex(ring, ll);
+        ring.insert(insertAt, ll);
+      }
+      _recalcPaddock(_editingIdx!);
+      _persistFarmJson(_buildFarmGeoJsonBytes());
+      _selectVertex(holeIdx: holeIdx, vertexIdx: insertAt);
+    }
+  }
+
+  void _deleteSelectedVertex() {
+    if (!_editorMode ||
+        _tool != EditorTool.edit ||
+        _editingIdx == null ||
+        _selectedVertexIdx == null) {
+      return;
+    }
+    final ring = _selectedRing();
+    if (ring == null) return;
+
+    // Last vertices of a hole → remove the whole hole (can't shrink below 3).
+    if (_selectedHoleIdx != null && ring.length <= 3) {
+      _deleteSelectedHole();
+      return;
+    }
+
+    if (ring.length <= 3) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('A paddock needs at least 3 vertices')),
+      );
+      return;
+    }
+    final i = _selectedVertexIdx!;
+    if (i < 0 || i >= ring.length) return;
+    setState(() {
+      ring.removeAt(i);
+      _clearVertexSelection();
+    });
+    _recalcPaddock(_editingIdx!);
+    _persistFarmJson(_buildFarmGeoJsonBytes());
+  }
+
+  void _deleteSelectedHole() {
+    if (!_editorMode ||
+        _tool != EditorTool.edit ||
+        _editingIdx == null ||
+        _selectedHoleIdx == null) {
+      return;
+    }
+    final idx = _editingIdx!;
+    final holeIdx = _selectedHoleIdx!;
+    final holes = _paddocks[idx].holes;
+    if (holeIdx < 0 || holeIdx >= holes.length) return;
+    setState(() {
+      holes.removeAt(holeIdx);
+      _clearVertexSelection();
+    });
+    _recalcPaddock(idx);
+    _persistFarmJson(_buildFarmGeoJsonBytes());
+  }
+
+  /// Index in [ring] at which to insert [p] (on the nearest edge).
+  int _nearestEdgeInsertIndex(List<LatLng> ring, LatLng p) {
+    if (ring.length < 2) return ring.length;
+    const dist = Distance();
+    var bestD = double.infinity;
+    var bestInsert = 1;
+    for (var i = 0; i < ring.length; i++) {
+      final a = ring[i];
+      final b = ring[(i + 1) % ring.length];
+      final d = _distancePointToSegmentM(dist, p, a, b);
+      if (d < bestD) {
+        bestD = d;
+        bestInsert = i + 1;
+      }
+    }
+    return bestInsert > ring.length ? ring.length : bestInsert;
+  }
+
+  double _distancePointToSegmentM(
+    Distance dist,
+    LatLng p,
+    LatLng a,
+    LatLng b,
+  ) {
+    final ab = dist.as(LengthUnit.Meter, a, b);
+    if (ab < 1e-3) return dist.as(LengthUnit.Meter, p, a);
+    // Local ENU projection around a for a stable segment distance.
+    final lat0 = a.latitude * math.pi / 180.0;
+    final mPerDegLat = 111320.0;
+    final mPerDegLon = 111320.0 * math.cos(lat0);
+    double x(LatLng q) => (q.longitude - a.longitude) * mPerDegLon;
+    double y(LatLng q) => (q.latitude - a.latitude) * mPerDegLat;
+    final ax = 0.0, ay = 0.0;
+    final bx = x(b), by = y(b);
+    final px = x(p), py = y(p);
+    final abx = bx - ax, aby = by - ay;
+    final t = ((px - ax) * abx + (py - ay) * aby) / (abx * abx + aby * aby);
+    final tc = t.clamp(0.0, 1.0);
+    final cx = ax + abx * tc, cy = ay + aby * tc;
+    return math.sqrt((px - cx) * (px - cx) + (py - cy) * (py - cy));
   }
 
 
@@ -979,6 +1303,145 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     );
   }
 
+  Widget _editorTitleChip() {
+    String title;
+    String? subtitle;
+    switch (_tool) {
+      case EditorTool.browse:
+        title = 'Edit paddocks';
+        subtitle = 'Tap a paddock or + to create';
+      case EditorTool.drawOuter:
+        title = _draftPaddockName ?? 'New paddock';
+        subtitle = '${_tempOuter.length} points — Add at crosshair';
+      case EditorTool.drawHole:
+        title = 'New hole';
+        subtitle = '${_tempHole.length} points — Add at crosshair';
+      case EditorTool.edit:
+        final name = (_editingIdx != null && _editingIdx! < _paddocks.length)
+            ? _paddocks[_editingIdx!].name
+            : 'Paddock';
+        title = 'Editing: $name';
+        if (_vertexLiveMove && _selectedVertexIdx != null) {
+          final where = _selectedHoleIdx == null ? 'outer' : 'hole';
+          subtitle = 'Dragging $where vertex — pan to move';
+        } else {
+          subtitle = 'Tap a vertex to drag, or Add / Hole';
+        }
+    }
+    return Material(
+      elevation: 2,
+      color: Theme.of(context).colorScheme.surface.withOpacity(0.94),
+      borderRadius: BorderRadius.circular(12),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.start,
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Text(
+              title,
+              style: Theme.of(context).textTheme.titleSmall?.copyWith(
+                    fontWeight: FontWeight.w700,
+                  ),
+            ),
+            if (subtitle != null) ...[
+              const SizedBox(height: 2),
+              Text(
+                subtitle,
+                style: Theme.of(context).textTheme.bodySmall,
+              ),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _editorActionBar() {
+    final canDelete =
+        _tool == EditorTool.edit && _selectedVertexIdx != null;
+    final canDeleteHole =
+        _tool == EditorTool.edit && _selectedHoleIdx != null;
+    final canFinishOuter =
+        _tool == EditorTool.drawOuter && _tempOuter.length >= 3;
+    final canFinishHole =
+        _tool == EditorTool.drawHole && _tempHole.length >= 3;
+    final canUndo = (_tool == EditorTool.drawOuter && _tempOuter.isNotEmpty) ||
+        (_tool == EditorTool.drawHole && _tempHole.isNotEmpty);
+
+    Widget chip(String label, VoidCallback? onTap, {bool primary = false}) {
+      final enabled = onTap != null;
+      final scheme = Theme.of(context).colorScheme;
+      return Material(
+        color: !enabled
+            ? scheme.surfaceContainerHighest.withOpacity(0.5)
+            : primary
+                ? scheme.primary
+                : scheme.surface,
+        elevation: enabled ? 2 : 0,
+        borderRadius: BorderRadius.circular(10),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(10),
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+            child: Text(
+              label,
+              style: TextStyle(
+                fontWeight: FontWeight.w700,
+                color: !enabled
+                    ? scheme.onSurface.withOpacity(0.38)
+                    : primary
+                        ? scheme.onPrimary
+                        : scheme.primary,
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return Material(
+      color: Theme.of(context).colorScheme.surface.withOpacity(0.94),
+      elevation: 4,
+      borderRadius: BorderRadius.circular(14),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+        child: SingleChildScrollView(
+          scrollDirection: Axis.horizontal,
+          child: Row(
+            children: [
+              chip('Add', _addVertexAtCrosshair),
+              if (_tool == EditorTool.edit) ...[
+                const SizedBox(width: 8),
+                chip('Hole', _startDrawHole),
+                const SizedBox(width: 8),
+                chip('Delete', canDelete ? _deleteSelectedVertex : null),
+                if (canDeleteHole) ...[
+                  const SizedBox(width: 8),
+                  chip('Del hole', _deleteSelectedHole),
+                ],
+              ],
+              if (_tool == EditorTool.drawOuter ||
+                  _tool == EditorTool.drawHole) ...[
+                const SizedBox(width: 8),
+                chip('Undo', canUndo ? _undoLastPoint : null),
+                const SizedBox(width: 8),
+                chip(
+                  'Finish',
+                  canFinishOuter || canFinishHole ? _finishDrawing : null,
+                  primary: true,
+                ),
+              ],
+              const SizedBox(width: 8),
+              chip('Done', _editorDone),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
   String _gpsSmoothnessLabel() {
     if (_gpsSmoothness <= 0) {
       return 'Off — marker and map snap to each GPS fix.';
@@ -1060,10 +1523,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   void _accumulateSpeedDistance(GpsFix p) {
     if (!_navMode || _lastSpeedFixTime == null || !p.hasSpeed) return;
+    final bucket = p.timestamp.millisecondsSinceEpoch ~/ _navSampleBucketMs;
+    if (_lastSpeedSampleBucket == bucket) return;
     final dt =
         p.timestamp.difference(_lastSpeedFixTime!).inMilliseconds / 1000.0;
     if (dt > 0 && dt < 20) {
       _speedDistanceM += p.speedMps! * dt;
+      _lastSpeedSampleBucket = bucket;
     }
   }
 
@@ -1156,6 +1622,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   void _onMapPositionChanged(MapPosition position, bool hasGesture) {
     _maybeRefreshPaddockLayersForZoom();
+    if (_editorMode &&
+        _vertexLiveMove &&
+        !_suppressVertexLiveMove &&
+        hasGesture) {
+      _snapSelectedVertexToCenter(persist: false);
+    }
     if (!hasGesture || _showingHistory) return;
     // Stop follow immediately so controller moves don't fight the pan gesture.
     if (_followGps) {
@@ -1164,6 +1636,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   void _onMapEvent(MapEvent event) {
+    if (_editorMode && _vertexLiveMove && !_suppressVertexLiveMove) {
+      // Fling doesn't always set hasGesture on positionChanged.
+      if (event is MapEventFlingAnimation) {
+        _snapSelectedVertexToCenter(persist: false);
+      }
+      if (event is MapEventMoveEnd ||
+          event is MapEventFlingAnimationEnd ||
+          event is MapEventDoubleTapZoomEnd) {
+        _snapSelectedVertexToCenter(persist: true);
+      }
+    }
     if (event is MapEventRotateEnd && mounted) {
       setState(() {});
     }
@@ -1348,18 +1831,23 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       return true;
     }
 
-    if (_editorEnabled && _tool != EditorTool.none) {
+    if (_editorMode) {
       if ((_tool == EditorTool.drawOuter && _tempOuter.isNotEmpty) ||
           (_tool == EditorTool.drawHole && _tempHole.isNotEmpty)) {
         _undoLastPoint();
         return true;
       }
-      setState(() {
-        _tool = EditorTool.none;
-        _tempOuter.clear();
-        _tempHole.clear();
-        _editingIdx = null;
-      });
+      if (_tool == EditorTool.edit && _vertexLiveMove) {
+        setState(() => _clearVertexSelection(persist: true));
+        return true;
+      }
+      if (_tool == EditorTool.edit ||
+          _tool == EditorTool.drawOuter ||
+          _tool == EditorTool.drawHole) {
+        _editorDone();
+        return true;
+      }
+      _exitEditorMode();
       return true;
     }
 
@@ -1615,6 +2103,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final gps = _currentPos;
     if (gps == null) return;
 
+    // One path sample per NMEA epoch (RMC+GGA used to double applied metres).
+    final bucket = p.timestamp.millisecondsSinceEpoch ~/ _navSampleBucketMs;
+    if (_lastSwathRecordBucket == bucket) return;
+
     final prev = _gpsRecordPath.isNotEmpty ? _gpsRecordPath.last : null;
     var segM = 0.0;
     if (prev != null) {
@@ -1626,6 +2118,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
       if (segM > _maxGpsJumpM) {
         _gpsRecordPath.add(gps);
+        _lastSwathRecordBucket = bucket;
         _lastTravelBearingDeg = const Distance().bearing(prev, gps);
         _rebuildJobPathFromGps();
         _syncNavPathCommitted();
@@ -1634,25 +2127,25 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
     }
 
-    final prevBoom = _jobPath.isNotEmpty ? _jobPath.last : null;
-
     _gpsRecordPath.add(gps);
+    _lastSwathRecordBucket = bucket;
     if (prev != null) {
       _lastTravelBearingDeg = const Distance().bearing(prev, gps);
     }
     _rebuildJobPathFromGps();
 
-    // Applied metres from boom-centre advance (less GPS zig-zag inflation).
-    // Overlaps still count because separate passes still add length.
+    // Applied metres = newly added boom segment after rebuild (not a stale tip).
     final speedOk = p.hasSpeed && p.speedMps! >= _minMovingSpeedMps;
     if (prev != null &&
-        prevBoom != null &&
-        _jobPath.isNotEmpty &&
+        _jobPath.length >= 2 &&
         speedOk &&
         (_selectedIdx.isEmpty ||
             (_inSelectedPaddock(prev) && _inSelectedPaddock(gps)))) {
-      final boomSegM =
-          const Distance().as(LengthUnit.Meter, prevBoom, _jobPath.last);
+      final boomSegM = const Distance().as(
+        LengthUnit.Meter,
+        _jobPath[_jobPath.length - 2],
+        _jobPath.last,
+      );
       if (boomSegM > 0 &&
           boomSegM <= _maxGpsJumpM &&
           !_isSharpZigZagBoomStep(boomSegM)) {
@@ -2007,131 +2500,90 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   // ---------- Map taps ----------
 
   void _onMapTap(TapPosition _, LatLng p) {
-    // Selection should always work. Editor-specific behavior only when enabled.
-    int? hit = _hitTestPaddock(p);
-
-    if (!_editorEnabled) {
-      // Editor hidden → normal selection
-      if (hit != null) {
-        setState(() {
-          _suppressAutoPaddockSelect = false;
-          _selectedIdx
-            ..clear()
-            ..add(hit);
-        });
-      } else {
-        setState(() {
-          _suppressAutoPaddockSelect = true;
-          _selectedIdx.clear();
-        });
+    if (_editorMode) {
+      if (_tool == EditorTool.drawOuter || _tool == EditorTool.drawHole) {
+        // Placement is via crosshair + Add — taps do not place points.
+        return;
       }
-      _rebuildPaddockLayers();
-      return;
-    }
-
-    // Editor is visible
-    if (_tool == EditorTool.drawOuter) {
-      _handleDrawOuterTap(p);
-      return;
-    }
-    if (_tool == EditorTool.drawHole) {
-      _handleDrawHoleTap(p);
-      return;
-    }
-    if (_tool == EditorTool.edit) {
-      // In edit mode, taps can switch which paddock is being edited
+      if (_tool == EditorTool.edit) {
+        // Deselect live vertex on empty map tap; retarget paddock if hit.
+        final hit = _hitTestPaddock(p);
+        if (hit != null && hit != _editingIdx) {
+          _selectPaddockForEdit(hit);
+          return;
+        }
+        if (_vertexLiveMove) {
+          setState(() => _clearVertexSelection(persist: true));
+        }
+        return;
+      }
+      // Browse: tap paddock to edit.
+      final hit = _hitTestPaddock(p);
       if (hit != null) {
-        setState(() {
-          _selectedIdx
-            ..clear()
-            ..add(hit);
-          _editingIdx = hit;
-        });
-        _rebuildPaddockLayers();
+        _selectPaddockForEdit(hit);
       }
       return;
     }
 
-    // No tool active → treat as selection
+    final hit = _hitTestPaddock(p);
     if (hit != null) {
       setState(() {
+        _suppressAutoPaddockSelect = false;
         _selectedIdx
           ..clear()
           ..add(hit);
-        _editingIdx = hit;
       });
     } else {
       setState(() {
+        _suppressAutoPaddockSelect = true;
         _selectedIdx.clear();
-        _editingIdx = null;
       });
     }
     _rebuildPaddockLayers();
-
-
-
   }
 
-  Widget _toolbarBtn(String label, {required VoidCallback onTap, bool enabled = true}) {
-    return InkWell(
-      onTap: enabled ? onTap : null,
-      borderRadius: BorderRadius.circular(8),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-        child: Text(label, style: Theme.of(context).textTheme.labelLarge?.copyWith(
-          color: enabled ? null : Theme.of(context).disabledColor,
-        )),
-      ),
-    );
-  }
+  Widget _buildVertexMarkers(Paddock p) {
+    if (!_editorMode || _tool != EditorTool.edit || _editingIdx == null) {
+      return const SizedBox.shrink();
+    }
+    final markers = <Marker>[];
 
-  Widget _buildVertexEditor(Paddock p) {
-    if (!_editorEnabled || _tool != EditorTool.edit || _editingIdx == null) return const SizedBox.shrink();
-    final handles = <DragMarker>[];
-
-    void addRing(List<LatLng> ring, void Function(int, LatLng) updateAt) {
+    void addRing(List<LatLng> ring, int? holeIdx, Color color, Color selected) {
       for (var i = 0; i < ring.length; i++) {
-        final pt = ring[i];
-        handles.add(DragMarker(
-          point: pt,
-          size: const Size(22, 22),
-          builder: (ctx, pos, isDragging) => Container(
-            width: 18, height: 18,
-            decoration: BoxDecoration(
-              shape: BoxShape.circle,
-              color: isDragging
-                  ? Theme.of(ctx).colorScheme.tertiary
-                  : Theme.of(ctx).colorScheme.primary,
-              boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 3)],
+        final isSel =
+            _selectedHoleIdx == holeIdx && _selectedVertexIdx == i;
+        markers.add(
+          Marker(
+            point: ring[i],
+            width: 28,
+            height: 28,
+            alignment: Alignment.center,
+            child: GestureDetector(
+              onTap: () => _selectVertex(holeIdx: holeIdx, vertexIdx: i),
+              child: Container(
+                width: isSel ? 22 : 16,
+                height: isSel ? 22 : 16,
+                decoration: BoxDecoration(
+                  shape: BoxShape.circle,
+                  color: isSel ? selected : color,
+                  border: Border.all(color: Colors.white, width: 2),
+                  boxShadow: const [
+                    BoxShadow(color: Colors.black26, blurRadius: 3),
+                  ],
+                ),
+              ),
             ),
           ),
-          onDragEnd: (details, newPos) {
-            setState(() { updateAt(i, newPos); });
-            _recalcPaddock(_editingIdx!);
-            _persistFarmJson(_buildFarmGeoJsonBytes());
-          },
-        ));
+        );
       }
     }
 
-    addRing(p.outer, (i, pos) => p.outer[i] = pos);
+    final scheme = Theme.of(context).colorScheme;
+    addRing(p.outer, null, scheme.primary, scheme.tertiary);
     for (var h = 0; h < p.holes.length; h++) {
-      addRing(p.holes[h], (i, pos) => p.holes[h][i] = pos);
+      addRing(p.holes[h], h, Colors.redAccent, Colors.orangeAccent);
     }
-
-    return DragMarkers(markers: handles);
-  }
-
-  int? _pickPaddockForEdit() {
-    if (_selectedIdx.isNotEmpty) return _selectedIdx.last;
-    double best = double.infinity;
-    int? bestIdx;
-    for (var i = 0; i < _paddocks.length; i++) {
-      final c = _centroid(_paddocks[i].outer);
-      final d = const Distance().distance(c, _dispPos ?? c);
-      if (d < best && d <= _hitMeters) { best = d; bestIdx = i; }
-    }
-    return bestIdx;
+    return MarkerLayer(markers: markers);
   }
 
   Future<String?> _promptName(BuildContext context) async {
@@ -2159,7 +2611,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   void _maybeAutoSelectPaddockFromGps() {
-    if (_showingHistory || _editorEnabled) return;
+    if (_showingHistory || _editorMode) return;
     final pos = _dispPos ?? _currentPos;
     if (pos == null || _paddocks.isEmpty) return;
 
@@ -2241,57 +2693,61 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     });
   }
 
-  void _handleDrawOuterTap(LatLng ll) {
-    if (_tempOuter.isNotEmpty) {
-      final d = const Distance().distance(_tempOuter.first, ll);
-      if (d < 3.0) { // snap to first point ~3m
-        _finishDrawing();
-        return;
-      }
-    }
-    setState(() => _tempOuter.add(ll));
-  }
-
-  void _handleDrawHoleTap(LatLng ll) {
-    if (_tempHole.isNotEmpty) {
-      final d = const Distance().distance(_tempHole.first, ll);
-      if (d < 3.0) { // snap to first
-        _finishDrawing();
-        return;
-      }
-    }
-    setState(() => _tempHole.add(ll));
-  }
-
   Future<void> _finishDrawing() async {
     if (_tool == EditorTool.drawOuter) {
-      if (_tempOuter.length < 3) return;
-      final name = await _promptName(context);
+      if (_tempOuter.length < 3) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Add at least 3 vertices')),
+        );
+        return;
+      }
+      final name = (_draftPaddockName != null && _draftPaddockName!.isNotEmpty)
+          ? _draftPaddockName!
+          : await _promptName(context);
       if (name == null || name.isEmpty) return;
       final outer = List<LatLng>.from(_tempOuter);
       final holes = <List<LatLng>>[];
       final area = _areaHa(outer, holes);
       final lp = _labelPoint(outer, holes);
       setState(() {
-        _paddocks.add(Paddock(name: name, outer: outer, holes: holes, areaHa: area, labelPoint: lp));
-        _tool = EditorTool.none;
+        _paddocks.add(
+          Paddock(
+            name: name,
+            outer: outer,
+            holes: holes,
+            areaHa: area,
+            labelPoint: lp,
+          ),
+        );
         _tempOuter.clear();
+        _draftPaddockName = null;
         _editingIdx = _paddocks.length - 1;
-        if (!_selectedIdx.contains(_editingIdx)) _selectedIdx.add(_editingIdx!);
+        _clearVertexSelection();
+        _tool = EditorTool.edit;
+        _selectedIdx
+          ..clear()
+          ..add(_editingIdx!);
       });
       await _persistFarmJson(_buildFarmGeoJsonBytes());
       _rebuildPaddockLayers();
       return;
     }
+
     if (_tool == EditorTool.drawHole && _editingIdx != null) {
-      if (_tempHole.length < 3) return;
+      if (_tempHole.length < 3) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Add at least 3 vertices for a hole')),
+        );
+        return;
+      }
       final idx = _editingIdx!;
       setState(() {
         _paddocks[idx].holes.add(List<LatLng>.from(_tempHole));
-        _recalcPaddock(idx);
-        _tool = EditorTool.none;
         _tempHole.clear();
+        _tool = EditorTool.edit;
+        _clearVertexSelection();
       });
+      _recalcPaddock(idx);
       await _persistFarmJson(_buildFarmGeoJsonBytes());
     }
   }
@@ -2340,6 +2796,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (_selectedIdx.isEmpty) return;
     setState(() {
       _navMode = true;
+      _editorMode = false;
+      _tool = EditorTool.browse;
+      _tempOuter.clear();
+      _tempHole.clear();
+      _draftPaddockName = null;
+      _editingIdx = null;
+      _clearVertexSelection();
       _pointA = null;
       _pointB = null;
       _navLinesNotifier.value = [];
@@ -2357,6 +2820,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
       _appliedDistanceM = 0.0;
       _currentSpeedKph = 0.0;
+      _lastSwathRecordBucket = null;
+      _lastSpeedSampleBucket = null;
       _clearSwathDisplay();
       _showingHistory = false;
       _activeHistoryJobs = [];
@@ -2772,20 +3237,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
         const Divider(),
         ListTile(
-          leading: Icon(Icons.edit_note),
-          title: Text(_editorEnabled ? 'Hide paddock editor' : 'Show paddock editor'),
-          subtitle: const Text('Draw paddocks, holes, and edit vertices'),
+          leading: const Icon(Icons.edit_note),
+          title: const Text('Edit paddocks'),
+          subtitle: const Text('Create and edit paddock boundaries'),
           onTap: () {
-            setState(() {
-              _editorEnabled = !_editorEnabled;
-              if (!_editorEnabled) {
-                _tool = EditorTool.none;
-                _tempOuter.clear();
-                _tempHole.clear();
-                _editingIdx = null;
-              }
-            });
             Navigator.of(context).maybePop();
+            _enterEditorMode();
           },
         ),
         const Divider(),
@@ -3575,7 +4032,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               initialCenter: startCenter,
               initialZoom: 16.0,
               onTap: _onMapTap,
-              onLongPress: (tp, latlng) { if (_tool == EditorTool.drawOuter || _tool == EditorTool.drawHole) _finishDrawing(); },
+              onLongPress: (tp, latlng) {
+                if (_editorMode &&
+                    (_tool == EditorTool.drawOuter ||
+                        _tool == EditorTool.drawHole)) {
+                  _finishDrawing();
+                }
+              },
               onMapReady: () {
                 setState(() {
                   _mapReady = true;
@@ -3651,7 +4114,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 ),
 
               // Temporary drawing preview (outer)
-              if (_tool == EditorTool.drawOuter && _tempOuter.length >= 2)
+              if (_editorMode &&
+                  _tool == EditorTool.drawOuter &&
+                  _tempOuter.length >= 2)
                 PolygonLayer(polygons: [
                   Polygon(
                     points: _tempOuter,
@@ -3661,21 +4126,71 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   )
                 ]),
 
-              // Temporary drawing preview (hole)
-              if (_tool == EditorTool.drawHole && _tempHole.length >= 2)
+              if (_editorMode &&
+                  _tool == EditorTool.drawOuter &&
+                  _tempOuter.isNotEmpty)
+                MarkerLayer(
+                  markers: [
+                    for (var i = 0; i < _tempOuter.length; i++)
+                      Marker(
+                        point: _tempOuter[i],
+                        width: 20,
+                        height: 20,
+                        alignment: Alignment.center,
+                        child: Container(
+                          width: 12,
+                          height: 12,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Theme.of(context).colorScheme.secondary,
+                            border: Border.all(color: Colors.white, width: 2),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+
+              // Temporary hole preview
+              if (_editorMode &&
+                  _tool == EditorTool.drawHole &&
+                  _tempHole.length >= 2)
                 PolygonLayer(polygons: [
                   Polygon(
                     points: _tempHole,
-                    color: Colors.red.withOpacity(0.06),
-                    borderColor: Colors.red,
+                    color: Colors.red.withOpacity(0.08),
+                    borderColor: Colors.redAccent,
                     borderStrokeWidth: 1.2,
-                    isFilled: true,
                   )
                 ]),
 
-              // Vertex drag handles when editing
-              if (_tool == EditorTool.edit && _editingIdx != null)
-                _editorEnabled ? _buildVertexEditor(_paddocks[_editingIdx!]) : const SizedBox.shrink(),
+              if (_editorMode &&
+                  _tool == EditorTool.drawHole &&
+                  _tempHole.isNotEmpty)
+                MarkerLayer(
+                  markers: [
+                    for (var i = 0; i < _tempHole.length; i++)
+                      Marker(
+                        point: _tempHole[i],
+                        width: 20,
+                        height: 20,
+                        alignment: Alignment.center,
+                        child: Container(
+                          width: 12,
+                          height: 12,
+                          decoration: BoxDecoration(
+                            shape: BoxShape.circle,
+                            color: Colors.redAccent,
+                            border: Border.all(color: Colors.white, width: 2),
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
+
+              if (_editorMode &&
+                  _tool == EditorTool.edit &&
+                  _editingIdx != null)
+                _buildVertexMarkers(_paddocks[_editingIdx!]),
 
               // Labels above swath
               ValueListenableBuilder<List<Marker>>(
@@ -3718,57 +4233,50 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             ],
           ),
 
-          // Editor toolbar
-          _editorEnabled ? Positioned(
-            top: MediaQuery.of(context).padding.top + 12,
-            left: 0,
-            right: 0,
-            child: Center(
-              child: Material(
-                color: Theme.of(context).colorScheme.surface.withOpacity(0.90),
-                elevation: 2,
-                borderRadius: BorderRadius.circular(12),
-                child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
-                  child: Wrap(
-                    spacing: 8,
-                    runSpacing: 4,
-                    children: [
-                      _toolbarBtn('Draw', onTap: () {
-                        setState(() {
-                          _tool = EditorTool.drawOuter;
-                          _tempOuter.clear();
-                          _tempHole.clear();
-                          _editingIdx = null;
-                        });
-                      }),
-                      _toolbarBtn('Add hole', onTap: () {
-                        final idx = _pickPaddockForEdit();
-                        if (idx == null) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Tap a paddock first to select it')),);
-                          return;
-                        }
-                        setState(() { _tool = EditorTool.drawHole; _editingIdx = idx; _tempHole.clear(); });
-                      }),
-                      _toolbarBtn('Edit verts', onTap: () {
-                        final idx = _pickPaddockForEdit();
-                        if (idx == null) {
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            const SnackBar(content: Text('Tap a paddock to select it first')),);
-                          return;
-                        }
-                        setState(() { _tool = EditorTool.edit; _editingIdx = idx; });
-                      }),
-                      _toolbarBtn('Undo', onTap: _undoLastPoint, enabled: _tool == EditorTool.drawOuter || _tool == EditorTool.drawHole),
-                      _toolbarBtn('Finish', onTap: _finishDrawing, enabled: _tool == EditorTool.drawOuter || _tool == EditorTool.drawHole),
-                      _toolbarBtn('Cancel', onTap: () { setState(() { _tool = EditorTool.none; _tempOuter.clear(); _tempHole.clear(); _editingIdx = null; }); }),
-                    ],
-                  ),
-                ),
+          // Paddock editor: crosshair + chrome
+          if (_editorMode) ...[
+            const IgnorePointer(
+              child: Center(
+                child: _EditorCrosshair(),
               ),
             ),
-          ) : const SizedBox.shrink(),
+            Positioned(
+              top: safe.top + _fabEdge,
+              left: _fabEdge,
+              right: _fabEdge + _fabSecondaryDiameter + _fabGap,
+              child: _editorTitleChip(),
+            ),
+            if (_tool == EditorTool.browse)
+              Positioned(
+                right: _fabEdge,
+                bottom: _fabEdge + safe.bottom,
+                child: _fatRoundActionButton(
+                  icon: Icons.add,
+                  heroTag: 'editorAddPaddock',
+                  onPressed: _startNewPaddock,
+                ),
+              ),
+            if (_tool == EditorTool.browse)
+              Positioned(
+                left: _fabEdge,
+                bottom: _fabEdge + safe.bottom,
+                child: _fatRoundActionButton(
+                  icon: Icons.check,
+                  diameter: _fabSecondaryDiameter,
+                  heroTag: 'editorDoneBrowse',
+                  onPressed: _editorDone,
+                ),
+              ),
+            if (_tool == EditorTool.drawOuter ||
+                _tool == EditorTool.drawHole ||
+                _tool == EditorTool.edit)
+              Positioned(
+                left: _fabEdge,
+                right: _fabEdge,
+                bottom: _fabEdge + safe.bottom,
+                child: _editorActionBar(),
+              ),
+          ],
 
           // Nav dashboard + optional guidance error HUD (bar goes edge-to-edge under status bar)
           if (_navMode)
@@ -3811,15 +4319,27 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   onPressed: _exitHistory,
                 ),
               ),
-            Positioned(
-              right: _fabEdge,
-              top: safe.top + _fabEdge,
-              child: _fatRoundActionButton(
-                icon: Icons.menu,
-                diameter: _fabSecondaryDiameter,
-                onPressed: () => _scaffoldKey.currentState?.openEndDrawer(),
+            if (!_editorMode)
+              Positioned(
+                right: _fabEdge,
+                top: safe.top + _fabEdge,
+                child: _fatRoundActionButton(
+                  icon: Icons.menu,
+                  diameter: _fabSecondaryDiameter,
+                  onPressed: () => _scaffoldKey.currentState?.openEndDrawer(),
+                ),
               ),
-            ),
+            if (_editorMode)
+              Positioned(
+                right: _fabEdge,
+                top: safe.top + _fabEdge,
+                child: _fatRoundActionButton(
+                  icon: Icons.close,
+                  diameter: _fabSecondaryDiameter,
+                  heroTag: 'editorExit',
+                  onPressed: _exitEditorMode,
+                ),
+              ),
           ],
 
           // Rotation toggle
@@ -3878,7 +4398,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             ),
 
           // Pre-nav: left info rail + Start
-          if (!_navMode && !_showingHistory && _selectedIdx.isNotEmpty && _completedJobSummary == null) ...[
+          if (!_navMode &&
+              !_editorMode &&
+              !_showingHistory &&
+              _selectedIdx.isNotEmpty &&
+              _completedJobSummary == null) ...[
             Positioned(
               left: _fabEdge,
               bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
@@ -3903,7 +4427,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           ],
 
           // Completed job summary (top — keeps bottom controls clear)
-          if (_completedJobSummary != null && !_navMode && !_showingHistory)
+          if (_completedJobSummary != null &&
+              !_navMode &&
+              !_editorMode &&
+              !_showingHistory)
             Positioned(
               top: 0, left: 0, right: 0,
               child: _completedJobSummaryPanel(),
@@ -3920,6 +4447,50 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       ),
     );
   }
+}
+
+/// Fixed screen-center crosshair for paddock vertex placement.
+class _EditorCrosshair extends StatelessWidget {
+  const _EditorCrosshair();
+
+  @override
+  Widget build(BuildContext context) {
+    final color = Theme.of(context).colorScheme.primary;
+    return SizedBox(
+      width: 44,
+      height: 44,
+      child: CustomPaint(
+        painter: _CrosshairPainter(color: color),
+      ),
+    );
+  }
+}
+
+class _CrosshairPainter extends CustomPainter {
+  _CrosshairPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = color
+      ..strokeWidth = 2
+      ..style = PaintingStyle.stroke;
+    final cx = size.width / 2;
+    final cy = size.height / 2;
+    const gap = 5.0;
+    const arm = 18.0;
+    canvas.drawLine(Offset(cx, cy - arm), Offset(cx, cy - gap), paint);
+    canvas.drawLine(Offset(cx, cy + gap), Offset(cx, cy + arm), paint);
+    canvas.drawLine(Offset(cx - arm, cy), Offset(cx - gap, cy), paint);
+    canvas.drawLine(Offset(cx + gap, cy), Offset(cx + arm, cy), paint);
+    canvas.drawCircle(Offset(cx, cy), 3, paint);
+  }
+
+  @override
+  bool shouldRepaint(covariant _CrosshairPainter oldDelegate) =>
+      oldDelegate.color != color;
 }
 
 // ---------- Historic job bottom panel ----------
