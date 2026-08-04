@@ -127,6 +127,18 @@ double pathDistanceMeters(List<LatLng> path) {
   return total;
 }
 
+/// Prefer stored applied metres, but fall back to path geometry when stored
+/// length is clearly inflated (boom zig-zag / dual-fix counting).
+///
+/// Overlap passes remain in [path], so using path length still counts them.
+double sanitizeAppliedPathDistanceM(double storedM, List<LatLng> path) {
+  final geom = pathDistanceMeters(path);
+  if (storedM <= 0) return geom;
+  if (geom <= 0) return storedM;
+  if (storedM > geom * 1.35) return geom;
+  return storedM;
+}
+
 /// Area applied in hectares (path length × swath width).
 double areaAppliedHa(List<LatLng> path, double swathWidthM) {
   return pathDistanceMeters(path) * swathWidthM / 10000.0;

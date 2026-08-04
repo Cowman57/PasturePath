@@ -18,8 +18,10 @@ import '../../app_theme.dart';
 import '../../models/paddock.dart';
 import '../../models/job.dart';
 import '../../models/gps_fix.dart';
+import '../../models/load_session.dart';
 import '../../services/backup_store.dart';
 import '../../services/job_store.dart';
+import '../../services/load_session_store.dart';
 import '../../services/geometry.dart';
 import '../../services/geojson_parser.dart';
 import '../../services/gps_display_smoother.dart';
@@ -28,6 +30,7 @@ import '../../services/gps/gps_source.dart';
 import '../../services/implement_kinematics.dart';
 import '../../models/tool_setup_dimensions.dart';
 import '../../services/tool_preset_store.dart';
+import '../../widgets/animated_popup.dart';
 import '../../widgets/navigation_arrow_icon.dart';
 import 'tool_setup_tab.dart';
 
@@ -109,6 +112,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   Future<List<JobFileSummary>>? _jobSummariesFuture;
   Future<List<BackupInfo>>? _backupsFuture;
 
+  /// Open product load (null if none).
+  LoadSession? _openLoadSession;
+  /// Closed-session rate/amount by job id for history.
+  Map<String, JobProductStats> _productStatsByJobId = {};
+
   // selection
   final Set<int> _selectedIdx = <int>{};
   bool _suppressAutoPaddockSelect = false;
@@ -131,8 +139,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   static const double _cameraRotateThresholdDeg = 1.0;
   static const int _guidanceScanRadius = 3;
   int _lastNavLogicMs = 0;
+  /// Desired follow aim (GPS). Separate from camera center so chase can finish.
   LatLng? _lastCameraTarget;
   double? _lastCameraRotationDeg;
+  AnimationController? _cameraSwoopCtrl;
+  static const Duration _cameraSwoopDuration = Duration(milliseconds: 480);
+  /// Soft chase factor per GPS smooth tick (~follow / travel-up).
+  static const double _cameraChaseAlpha = 0.28;
+  /// Jump farther than this → swoop instead of soft chase (startup / recenter).
+  static const double _cameraSwoopDistanceM = 40.0;
+  /// Keep chasing until camera is this close to the aim point.
+  static const double _cameraChaseSettleM = 0.2;
 
   // look-ahead line (nav mode)
 
@@ -362,7 +379,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     });
 
     final target = ring[vertexIdx];
-    _mapController.move(target, _mapController.camera.zoom);
+    _swoopCamera(center: target);
     _runAfterMapFrame(() {
       if (!mounted) return;
       _suppressVertexLiveMove = false;
@@ -556,6 +573,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
       if (mounted) setState(() {});
       await _loadPersistedFarmJsonIfAny();
+      await _refreshLoadSessionState();
       await _ensureLocationFlow();
     });
   }
@@ -578,6 +596,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _navHudTickNotifier.dispose();
     _paddockPolysNotifier.dispose();
     _paddockLabelsNotifier.dispose();
+    _cameraSwoopCtrl?.dispose();
     _chevCtrl.dispose();
     _drawerTabCtrl.dispose();
     super.dispose();
@@ -710,7 +729,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final created = preview['createdAt']?.toString() ?? 'unknown date';
 
     if (!mounted) return;
-    final ok = await showDialog<bool>(
+    final ok = await showFadeDialog<bool>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Restore backup?'),
@@ -781,7 +800,425 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     });
     _rebuildPaddockLayers();
     await _loadPersistedFarmJsonIfAny();
+    await _refreshLoadSessionState();
     _resetToMapDefaults();
+  }
+
+  Future<void> _refreshLoadSessionState() async {
+    final open = await LoadSessionStore.openSession();
+    final stats = await LoadSessionStore.productStatsByJobId();
+    if (!mounted) return;
+    setState(() {
+      _openLoadSession = open;
+      _productStatsByJobId = stats;
+    });
+  }
+
+  Future<void> _openProductLoadSheet() async {
+    await _refreshLoadSessionState();
+    if (!mounted) return;
+    final open = _openLoadSession;
+    if (open == null) {
+      await _showStartLoadDialog();
+    } else {
+      await _showOpenLoadDialog(open);
+    }
+  }
+
+  Future<void> _showStartLoadDialog() async {
+    final nameCtrl = TextEditingController();
+    final startCtrl = TextEditingController();
+    final rateCtrl = TextEditingController();
+    final productKgCtrl = TextEditingController();
+    final productRateCtrl = TextEditingController();
+    var unit = 'kg';
+    final ok = await showFadeDialog<bool>(
+      context: context,
+      builder: (ctx) {
+        return StatefulBuilder(
+          builder: (ctx, setLocal) {
+            return AlertDialog(
+              title: const Text('Start product load'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    SegmentedButton<String>(
+                      segments: const [
+                        ButtonSegment(value: 'kg', label: Text('kg')),
+                        ButtonSegment(value: 'L', label: Text('L')),
+                      ],
+                      selected: {unit},
+                      onSelectionChanged: (s) => setLocal(() => unit = s.first),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: nameCtrl,
+                      textCapitalization: TextCapitalization.words,
+                      decoration: const InputDecoration(
+                        labelText: 'Product name',
+                        hintText: 'eg. Urea',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: startCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: InputDecoration(
+                        labelText: unit == 'L'
+                            ? 'Start reading (L)'
+                            : 'Start reading (kg)',
+                        hintText: 'eg. 2000',
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: rateCtrl,
+                      keyboardType: const TextInputType.numberWithOptions(
+                        decimal: true,
+                      ),
+                      decoration: InputDecoration(
+                        labelText: unit == 'L'
+                            ? 'Target spray rate (L/ha)'
+                            : 'Target rate (kg/ha)',
+                        hintText: unit == 'L' ? 'eg. 100' : 'eg. 80',
+                      ),
+                    ),
+                    if (unit == 'L') ...[
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: productKgCtrl,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: const InputDecoration(
+                          labelText: 'Product loaded (kg)',
+                          hintText: 'eg. 300  (dissolved urea)',
+                          helperText: 'Solid product in this tank fill',
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      TextField(
+                        controller: productRateCtrl,
+                        keyboardType: const TextInputType.numberWithOptions(
+                          decimal: true,
+                        ),
+                        decoration: const InputDecoration(
+                          labelText: 'Target product rate (kg/ha)',
+                          hintText: 'eg. 35',
+                          helperText: 'Optional — urea / solid rate',
+                        ),
+                      ),
+                    ],
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, false),
+                  child: const Text('Cancel'),
+                ),
+                ElevatedButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  child: const Text('Start'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    if (ok != true || !mounted) return;
+    final startQty = double.tryParse(startCtrl.text.trim());
+    final rate = double.tryParse(rateCtrl.text.trim());
+    final productKg = double.tryParse(productKgCtrl.text.trim());
+    final productRate = double.tryParse(productRateCtrl.text.trim());
+    if (startQty == null || startQty < 0 || rate == null || rate <= 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter valid start reading and target rate')),
+      );
+      return;
+    }
+    try {
+      await LoadSessionStore.start(
+        startQty: startQty,
+        targetRatePerHa: rate,
+        unit: unit,
+        productName: nameCtrl.text,
+        productLoadedKg: unit == 'L' ? productKg : null,
+        targetProductRatePerHa: unit == 'L' ? productRate : null,
+      );
+      await _refreshLoadSessionState();
+      if (!mounted) return;
+      final name = nameCtrl.text.trim();
+      final label = name.isEmpty ? unit : name;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            unit == 'L' && productRate != null && productRate > 0
+                ? 'Load started · $label · ${productRate.toStringAsFixed(0)} kg/ha · ${rate.toStringAsFixed(0)} L/ha'
+                : 'Load started · $label · target ${rate.toStringAsFixed(0)} $unit/ha',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not start load: $e')),
+      );
+    }
+  }
+
+  Future<void> _showOpenLoadDialog(LoadSession open) async {
+    final readingCtrl = TextEditingController(
+      text: open.expectedQtyNow > 0
+          ? open.expectedQtyNow.toStringAsFixed(0)
+          : '',
+    );
+    final action = await showFadeDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: Text(open.displayName),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (open.productName != null &&
+                    open.productName!.trim().isNotEmpty)
+                  Text('Product: ${open.productName}'),
+                Text(
+                  'Fill start: ${open.startQty.toStringAsFixed(0)} ${open.unitLabel}',
+                ),
+                Text(
+                  'Current start: ${open.currentQty.toStringAsFixed(0)} ${open.unitLabel}',
+                ),
+                Text(
+                  open.unit == 'L'
+                      ? 'Target spray: ${open.targetRatePerHa.toStringAsFixed(0)} ${open.rateUnitLabel}'
+                      : 'Target: ${open.targetRatePerHa.toStringAsFixed(0)} ${open.rateUnitLabel}',
+                ),
+                if (open.productLoadedKg != null && open.productLoadedKg! > 0)
+                  Text(
+                    'Product loaded: ${open.productLoadedKg!.toStringAsFixed(0)} kg',
+                  ),
+                if (open.targetProductRatePerHa != null &&
+                    open.targetProductRatePerHa! > 0)
+                  Text(
+                    'Target product: ${open.targetProductRatePerHa!.toStringAsFixed(0)} kg/ha',
+                  ),
+                Text('Jobs: ${open.jobs.length}'),
+                Text(
+                  'Applied: ${_areaText(open.totalAppliedHa)}',
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  'Expected now: ${open.expectedQtyNow.toStringAsFixed(0)} ${open.unitLabel}',
+                  style: const TextStyle(fontWeight: FontWeight.w700),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: readingCtrl,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: InputDecoration(
+                    labelText: 'Scale reading (${open.unitLabel})',
+                    hintText: 'After a paddock or when finishing',
+                    helperText:
+                        'Record keeps the load open — this becomes the new start. End load closes it.',
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'cancel_load'),
+              child: const Text('Discard'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Close'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'record'),
+              child: const Text('Record'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, 'end'),
+              child: const Text('End load'),
+            ),
+          ],
+        );
+      },
+    );
+    if (!mounted) return;
+    if (action == 'cancel_load') {
+      final confirm = await showFadeDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Discard open load?'),
+          content: const Text(
+            'Jobs already finished stay in history, but rate tracking for this load is removed.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Keep'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Discard'),
+            ),
+          ],
+        ),
+      );
+      if (confirm == true) {
+        await LoadSessionStore.cancelOpen();
+        await _refreshLoadSessionState();
+      }
+      return;
+    }
+    if (action != 'record' && action != 'end') return;
+    final reading = double.tryParse(readingCtrl.text.trim());
+    if (reading == null || reading < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a valid scale reading')),
+      );
+      return;
+    }
+    try {
+      if (action == 'record') {
+        final updated = await LoadSessionStore.recordReading(reading: reading);
+        await _refreshLoadSessionState();
+        if (!mounted) return;
+        final used = updated.measuredUsedQty;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text(
+              'Reading saved · new start ${updated.currentQty.toStringAsFixed(0)} ${updated.unitLabel}'
+              '${used > 0 ? ' · ${used.toStringAsFixed(0)} ${updated.unitLabel} measured so far' : ''}',
+            ),
+          ),
+        );
+        return;
+      }
+      final closed = await LoadSessionStore.endLoad(endQty: reading);
+      await _refreshLoadSessionState();
+      if (!mounted) return;
+      final rate = closed.actualRatePerHa;
+      final used = closed.usedQty;
+      final prodRate = closed.actualProductRatePerHa;
+      final prodUsed = closed.productUsedKg;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            rate == null || used == null
+                ? 'Load ended'
+                : prodRate != null && prodUsed != null
+                    ? 'Load ended · ${closed.displayName} ${prodUsed.toStringAsFixed(0)} kg (${prodRate.toStringAsFixed(0)} kg/ha) · ${used.toStringAsFixed(0)} L (${rate.toStringAsFixed(0)} L/ha) over ${_areaText(closed.totalAppliedHa)}'
+                    : 'Load ended · ${closed.displayName} ${used.toStringAsFixed(0)} ${closed.unitLabel} over ${_areaText(closed.totalAppliedHa)} · ${rate.toStringAsFixed(0)} ${closed.rateUnitLabel}',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not save reading: $e')),
+      );
+    }
+  }
+
+  /// Optional post-job scale reading while a load is open.
+  Future<void> _promptLoadReadingAfterJob() async {
+    final open = _openLoadSession;
+    if (open == null || !mounted) return;
+    final readingCtrl = TextEditingController(
+      text: open.expectedQtyNow > 0
+          ? open.expectedQtyNow.toStringAsFixed(0)
+          : '',
+    );
+    final action = await showFadeDialog<String>(
+      context: context,
+      builder: (ctx) {
+        return AlertDialog(
+          title: const Text('Scale reading?'),
+          content: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Log the scale now for a precise rate on this paddock. '
+                  'The reading becomes the new start for the next one.',
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Current start: ${open.currentQty.toStringAsFixed(0)} ${open.unitLabel}',
+                ),
+                Text(
+                  'Expected: ${open.expectedQtyNow.toStringAsFixed(0)} ${open.unitLabel}',
+                ),
+                const SizedBox(height: 8),
+                TextField(
+                  controller: readingCtrl,
+                  autofocus: true,
+                  keyboardType: const TextInputType.numberWithOptions(
+                    decimal: true,
+                  ),
+                  decoration: InputDecoration(
+                    labelText: 'Scale reading (${open.unitLabel})',
+                  ),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, 'skip'),
+              child: const Text('Skip'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, 'record'),
+              child: const Text('Save reading'),
+            ),
+          ],
+        );
+      },
+    );
+    if (!mounted || action != 'record') return;
+    final reading = double.tryParse(readingCtrl.text.trim());
+    if (reading == null || reading < 0) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Enter a valid scale reading')),
+      );
+      return;
+    }
+    try {
+      final updated = await LoadSessionStore.recordReading(reading: reading);
+      await _refreshLoadSessionState();
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            'Reading saved · new start ${updated.currentQty.toStringAsFixed(0)} ${updated.unitLabel}',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not save reading: $e')),
+      );
+    }
   }
 
   Future<void> _savePrefs() async {
@@ -965,43 +1402,149 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   void _applyDisplayCamera() {
     if (!_mapReady || _dispPos == null) return;
+    // Discrete swoop in progress — don't fight it with chase.
+    if (_cameraSwoopCtrl?.isAnimating == true) return;
+
+    double? targetRot;
     switch (_rotationMode) {
       case RotationMode.northUp:
         final rot = _mapController.camera.rotation;
-        if (rot.abs() > 0.01) {
-          final last = _lastCameraRotationDeg;
-          if (last == null || last.abs() > 0.01) {
-            _applyMapRotation(0);
-            _lastCameraRotationDeg = 0;
-          }
-        }
+        if (rot.abs() > 0.05) targetRot = 0;
         break;
       case RotationMode.travelUp:
         final hdg = _tractorHeadingDeg();
-        if (hdg != null) {
-          final target = -hdg;
-          final last = _lastCameraRotationDeg;
-          if (last == null ||
-              (target - last).abs() >= _cameraRotateThresholdDeg) {
-            _applyMapRotation(target);
-            _lastCameraRotationDeg = target;
-          }
-        }
+        if (hdg != null) targetRot = _nearestRotation(-hdg);
         break;
       case RotationMode.free:
         break;
     }
+
+    final cam = _mapController.camera;
+
+    // Update follow aim when GPS moves enough (throttle).
+    LatLng? aimCenter;
     if (_followGps && !_showingHistory) {
-      final last = _lastCameraTarget;
-      // In nav, keep the camera glued to GPS; looser threshold only when browsing.
-      final threshold = _navMode ? 0.15 : _cameraMoveThresholdM;
-      final needMove = last == null ||
-          const Distance().as(LengthUnit.Meter, last, _dispPos!) >= threshold;
-      if (needMove) {
-        _mapController.move(_dispPos!, _mapController.camera.zoom);
+      final lastAim = _lastCameraTarget;
+      final threshold = _navMode ? 0.12 : _cameraMoveThresholdM;
+      if (lastAim == null ||
+          const Distance().as(LengthUnit.Meter, lastAim, _dispPos!) >=
+              threshold) {
         _lastCameraTarget = _dispPos;
       }
+      aimCenter = _lastCameraTarget;
     }
+
+    // First fix / large jump: swoop so startup actually reaches the marker.
+    if (aimCenter != null) {
+      final jumpM =
+          const Distance().as(LengthUnit.Meter, cam.center, aimCenter);
+      if (jumpM >= _cameraSwoopDistanceM) {
+        _swoopCamera(
+          center: aimCenter,
+          rotationDeg: targetRot,
+        );
+        return;
+      }
+    }
+
+    // Soft chase while the camera still lags the aim (not only when GPS moves).
+    LatLng? chaseCenter;
+    if (aimCenter != null) {
+      final lagM =
+          const Distance().as(LengthUnit.Meter, cam.center, aimCenter);
+      if (lagM >= _cameraChaseSettleM) chaseCenter = aimCenter;
+    }
+
+    if (chaseCenter == null && targetRot == null) return;
+
+    var nextCenter = cam.center;
+    var nextRot = cam.rotation;
+
+    if (chaseCenter != null) {
+      nextCenter = LatLng(
+        cam.center.latitude +
+            (chaseCenter.latitude - cam.center.latitude) * _cameraChaseAlpha,
+        cam.center.longitude +
+            (chaseCenter.longitude - cam.center.longitude) * _cameraChaseAlpha,
+      );
+    }
+    if (targetRot != null) {
+      nextRot = cam.rotation + (targetRot - cam.rotation) * _cameraChaseAlpha;
+      _lastCameraRotationDeg = targetRot;
+    }
+    _mapController.moveAndRotate(nextCenter, cam.zoom, nextRot);
+  }
+
+  /// Shortest equivalent heading nearest to current camera rotation.
+  double _nearestRotation(double degrees) {
+    final current = _mapReady ? _mapController.camera.rotation : degrees;
+    var best = degrees;
+    var bestAbs = (degrees - current).abs();
+    for (final candidate in [degrees - 360.0, degrees + 360.0]) {
+      final d = (candidate - current).abs();
+      if (d < bestAbs) {
+        bestAbs = d;
+        best = candidate;
+      }
+    }
+    return best;
+  }
+
+  void _stopCameraSwoop() {
+    _cameraSwoopCtrl?.stop();
+    _cameraSwoopCtrl?.dispose();
+    _cameraSwoopCtrl = null;
+  }
+
+  /// Animated swoop for discrete camera jumps (recenter, mode change, fit).
+  void _swoopCamera({
+    LatLng? center,
+    double? zoom,
+    double? rotationDeg,
+    Duration duration = _cameraSwoopDuration,
+  }) {
+    if (!_mapReady) {
+      if (center != null) {
+        _mapController.move(center, zoom ?? _mapController.camera.zoom);
+      }
+      if (rotationDeg != null) _mapController.rotate(rotationDeg);
+      return;
+    }
+    _stopCameraSwoop();
+    final startCenter = _mapController.camera.center;
+    final startZoom = _mapController.camera.zoom;
+    final startRot = _mapController.camera.rotation;
+    final endCenter = center ?? startCenter;
+    final endZoom = zoom ?? startZoom;
+    final endRot =
+        rotationDeg != null ? _nearestRotation(rotationDeg) : startRot;
+
+    _cameraSwoopCtrl = AnimationController(vsync: this, duration: duration);
+    final curved = CurvedAnimation(
+      parent: _cameraSwoopCtrl!,
+      curve: Curves.easeInOutCubic,
+    );
+    curved.addListener(() {
+      if (!mounted || !_mapReady) return;
+      final t = curved.value;
+      _mapController.moveAndRotate(
+        LatLng(
+          startCenter.latitude + (endCenter.latitude - startCenter.latitude) * t,
+          startCenter.longitude +
+              (endCenter.longitude - startCenter.longitude) * t,
+        ),
+        startZoom + (endZoom - startZoom) * t,
+        startRot + (endRot - startRot) * t,
+      );
+    });
+    _cameraSwoopCtrl!.addStatusListener((status) {
+      if (status == AnimationStatus.completed ||
+          status == AnimationStatus.dismissed) {
+        _lastCameraTarget = endCenter;
+        _lastCameraRotationDeg = endRot;
+      }
+    });
+    _cameraSwoopCtrl!.forward();
   }
 
   // ---------- Helpers ----------
@@ -1131,6 +1674,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     required String areaLabel,
     required String? historyPaddockName,
   }) {
+    final load = _openLoadSession;
+    final loadLabel = load == null
+        ? 'Load'
+        : '${load.expectedQtyNow.toStringAsFixed(0)}${load.unitLabel}';
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.center,
@@ -1153,6 +1700,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _jobRailChip(
           icon: Icons.square_foot,
           label: areaLabel,
+        ),
+        const SizedBox(height: _fabGap),
+        _jobRailChip(
+          icon: Icons.scale,
+          label: loadLabel,
+          onTap: _openProductLoadSheet,
         ),
         if (historyPaddockName != null) ...[
           const SizedBox(height: _fabGap),
@@ -1468,24 +2021,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     );
   }
 
-  /// Drop micro zig-zag boom hops that inflate applied metres (mirrors simplify).
-  bool _isSharpZigZagBoomStep(double boomSegM) {
-    if (_jobPath.length < 3 || boomSegM >= 3.0) return false;
-    final a = _jobPath[_jobPath.length - 3];
-    final b = _jobPath[_jobPath.length - 2];
-    final c = _jobPath.last;
-    final bearingIn = const Distance().bearing(a, b);
-    final bearingOut = const Distance().bearing(b, c);
-    var turn = bearingOut - bearingIn;
-    while (turn > 180) {
-      turn -= 360;
-    }
-    while (turn < -180) {
-      turn += 360;
-    }
-    return turn.abs() > 28;
-  }
-
   double? _pathTravelBearingDeg() {
     if (_gpsRecordPath.length >= 2) {
       final a = _gpsRecordPath[_gpsRecordPath.length - 2];
@@ -1587,24 +2122,18 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     return geom;
   }
 
-  void _applyMapRotation(double degrees) {
+  void _applyMapRotation(double degrees, {bool animate = true}) {
     if (!_mapReady) {
       _mapController.rotate(degrees);
       return;
     }
-    var target = degrees;
-    final current = _mapController.camera.rotation;
-    // Pick equivalent angle nearest to current to avoid 360° spins in travel-up.
-    var best = target;
-    var bestAbs = (target - current).abs();
-    for (final candidate in [target - 360, target + 360]) {
-      final d = (candidate - current).abs();
-      if (d < bestAbs) {
-        bestAbs = d;
-        best = candidate;
-      }
+    final best = _nearestRotation(degrees);
+    if (animate) {
+      _swoopCamera(rotationDeg: best);
+    } else {
+      _mapController.rotate(best);
+      _lastCameraRotationDeg = best;
     }
-    _mapController.rotate(best);
   }
 
   void _resetToMapDefaults({bool moveToGps = true}) {
@@ -1613,10 +2142,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _followGps = true;
     });
     if (_mapReady) {
-      _applyMapRotation(0);
-      if (moveToGps && _dispPos != null) {
-        _mapController.move(_dispPos!, _mapController.camera.zoom);
-      }
+      _swoopCamera(
+        center: moveToGps ? _dispPos : null,
+        rotationDeg: 0,
+      );
     }
   }
 
@@ -1629,6 +2158,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _snapSelectedVertexToCenter(persist: false);
     }
     if (!hasGesture || _showingHistory) return;
+    _stopCameraSwoop();
     // Stop follow immediately so controller moves don't fight the pan gesture.
     if (_followGps) {
       setState(() => _followGps = false);
@@ -1679,8 +2209,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (_dispPos != null && _mapReady) {
       setState(() => _followGps = true);
       _resetCameraThrottle();
-      _mapController.move(_dispPos!, _mapController.camera.zoom);
-      _lastCameraTarget = _dispPos;
+      final hdg = _rotationMode == RotationMode.travelUp
+          ? _tractorHeadingDeg()
+          : null;
+      _swoopCamera(
+        center: _dispPos,
+        rotationDeg: hdg != null ? -hdg : (_rotationMode == RotationMode.northUp ? 0 : null),
+      );
     }
   }
 
@@ -1870,7 +2405,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       return;
     }
     if (!mounted) return;
-    final choice = await showDialog<String>(
+    final choice = await showFadeDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('End job?'),
@@ -1893,10 +2428,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   Future<void> _showHistoryJobsFromPaths(List<String> paths) async {
     if (paths.isEmpty || !mounted) return;
     _closeEndDrawer();
-    showDialog<void>(
+    showFadeDialog<void>(
       context: context,
       barrierDismissible: false,
-      builder: (_) => const Center(child: CircularProgressIndicator()),
+      builder: (_) => const Material(
+        type: MaterialType.transparency,
+        child: Center(child: CircularProgressIndicator()),
+      ),
     );
     try {
       final jobs = <SavedJob>[];
@@ -2134,23 +2672,16 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
     _rebuildJobPathFromGps();
 
-    // Applied metres = newly added boom segment after rebuild (not a stale tip).
+    // Applied metres from GPS along-track (not boom tip). Boom zig-zag from
+    // heading noise at 25 Hz was inflating coverage ~1.8× vs the real pass length.
     final speedOk = p.hasSpeed && p.speedMps! >= _minMovingSpeedMps;
     if (prev != null &&
-        _jobPath.length >= 2 &&
+        segM > 0 &&
+        segM <= _maxGpsJumpM &&
         speedOk &&
         (_selectedIdx.isEmpty ||
             (_inSelectedPaddock(prev) && _inSelectedPaddock(gps)))) {
-      final boomSegM = const Distance().as(
-        LengthUnit.Meter,
-        _jobPath[_jobPath.length - 2],
-        _jobPath.last,
-      );
-      if (boomSegM > 0 &&
-          boomSegM <= _maxGpsJumpM &&
-          !_isSharpZigZagBoomStep(boomSegM)) {
-        _appliedDistanceM += boomSegM;
-      }
+      _appliedDistanceM += segM;
     }
 
     _syncNavPathCommitted();
@@ -2588,7 +3119,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   Future<String?> _promptName(BuildContext context) async {
     final c = TextEditingController();
-    return showDialog<String>(
+    return showFadeDialog<String>(
       context: context,
       builder: (ctx) => AlertDialog(
         title: const Text('Paddock name'),
@@ -2838,7 +3369,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     if (_mapReady && _dispPos != null) {
       final hdg = _tractorHeadingDeg();
-      if (hdg != null) _applyMapRotation(-hdg);
       final p = _dispPos!;
       final latRad = p.latitude * math.pi / 180.0;
       final widthM = _toMeters(_width <= 0 ? 3.0 : _width);
@@ -2847,7 +3377,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       final mpp0 = 156543.03392 * math.cos(latRad);
       final denom = (screenW * mpp0 / acrossM).clamp(1.0, 1e12);
       final z = math.log(denom) / math.ln2;
-      _mapController.move(p, z.clamp(5.0, 22.0));
+      _swoopCamera(
+        center: p,
+        zoom: z.clamp(5.0, 22.0),
+        rotationDeg: hdg != null ? -hdg : null,
+      );
     }
     if (_jobPath.isNotEmpty) _rebuildNavOverlays();
     _updateImplementGeometry();
@@ -2872,12 +3406,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     _jobFinishInProgress = true;
     if (!mounted) return;
-    showDialog<void>(
+    showFadeDialog<void>(
       context: context,
       barrierDismissible: false,
       builder: (_) => const PopScope(
         canPop: false,
-        child: Center(child: CircularProgressIndicator()),
+        child: Material(
+          type: MaterialType.transparency,
+          child: Center(child: CircularProgressIndicator()),
+        ),
       ),
     );
     try {
@@ -2890,10 +3427,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _jobPath,
         minDistM: _jobSaveSimplifyMinDistM,
       );
-      // Prefer live boom-gated applied metres; fall back to simplified path length.
-      final pathDistanceM = _appliedDistanceM > 0
+      // Paddock-gated GPS metres; clamp to simplified path if still inflated.
+      final rawApplied = _appliedDistanceM > 0
           ? _appliedDistanceM
           : pathDistanceMeters(savedPath);
+      final pathDistanceM =
+          sanitizeAppliedPathDistanceM(rawApplied, savedPath);
 
       final durHrs = end.difference(_jobStartTime!).inMilliseconds / 3600000.0;
       final avgKph = durHrs > 0 ? (_speedDistanceM / 1000.0) / durHrs : 0.0;
@@ -2924,6 +3463,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
       await JobStore.save(job);
 
+      final appliedHa = job.areaAppliedHaFor(widthM);
+      await LoadSessionStore.attachJob(jobId: job.id, appliedHa: appliedHa);
+      await _refreshLoadSessionState();
+
       if (!mounted) return;
       Navigator.of(context, rootNavigator: true).pop();
 
@@ -2939,6 +3482,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _invalidateJobSummariesCache();
       });
       _resetToMapDefaults();
+      await _promptLoadReadingAfterJob();
     } catch (e) {
       if (mounted) {
         if (Navigator.of(context, rootNavigator: true).canPop()) {
@@ -3275,7 +3819,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               subtitle: Text('${latest.jobCount} job(s)${latest.hasFarmJson ? ', farm map' : ''}'),
               trailing: TextButton(
                 onPressed: () async {
-                  final ok = await showDialog<bool>(
+                  final ok = await showFadeDialog<bool>(
                     context: context,
                     builder: (ctx) => AlertDialog(
                       title: const Text('Restore latest backup?'),
@@ -3485,7 +4029,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                         constraints: const BoxConstraints(minWidth: 40, minHeight: 40),
                         padding: EdgeInsets.zero,
                         onPressed: _histSelected.isEmpty ? null : () async {
-                          final ok = await showDialog<bool>(
+                          final ok = await showFadeDialog<bool>(
                             context: context,
                             builder: (ctx) => AlertDialog(
                               title: const Text('Delete selected jobs?'),
@@ -3623,11 +4167,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                               DataColumn(label: Text('Applied', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12))),
                               DataColumn(label: Text('Time', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12))),
                               DataColumn(label: Text('Coverage', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12))),
+                              DataColumn(label: Text('Rate', style: TextStyle(fontWeight: FontWeight.w600, fontSize: 12))),
                             ],
                             rows: dayJobs.map((entry) {
                               final j = entry;
                               final selected = _histSelected.contains(entry.filePath);
                               final paddock = j.paddockNames.join(', ');
+                              final product = _productStatsByJobId[j.id];
                               return DataRow(
                                 selected: selected,
                                 onSelectChanged: _histSelecting ? (_) {
@@ -3666,6 +4212,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                                   DataCell(Text(_areaText(_summaryAreaAppliedHa(j)), style: const TextStyle(fontSize: 12))),
                                   DataCell(Text(_formatTime(j.startedAt), style: const TextStyle(fontSize: 12))),
                                   DataCell(Text('${_summaryCoveragePercent(j).toStringAsFixed(0)}%', style: const TextStyle(fontSize: 12))),
+                                  DataCell(Text(
+                                    product?.shortLabel ?? '—',
+                                    style: const TextStyle(fontSize: 12),
+                                  )),
                                 ],
                               );
                             }).toList(),
@@ -3744,6 +4294,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   Widget _completedJobSummaryPanel() {
     final j = _completedJobSummary!;
     final scheme = Theme.of(context).colorScheme;
+    final appliedHa = _jobAreaAppliedHa(j);
+    final load = _openLoadSession;
+    final closedStats = _productStatsByJobId[j.id];
+    final plannedQty = load != null && appliedHa > 0
+        ? load.targetRatePerHa * appliedHa
+        : null;
 
     Widget stat(String label, String value) {
       return Column(
@@ -3823,12 +4379,110 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 runSpacing: 6,
                 children: [
                   stat('Area', _areaText(j.totalHa)),
-                  stat('Applied', _areaText(_jobAreaAppliedHa(j))),
+                  stat('Applied', _areaText(appliedHa)),
                   stat('Coverage', '${_jobCoveragePercent(j).toStringAsFixed(0)}%'),
                   stat('Swath', _jobSwathWidthText(j)),
                   stat('Avg speed', '${j.avgSpeedKph.toStringAsFixed(1)} km/h'),
                 ],
               ),
+              if (load != null) ...[
+                const SizedBox(height: 10),
+                Text(
+                  load.displayName,
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                    color: scheme.onSecondaryContainer,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 16,
+                  runSpacing: 6,
+                  children: [
+                    stat(
+                      'Expected scales',
+                      '${load.expectedQtyNow.toStringAsFixed(0)} ${load.unitLabel}',
+                    ),
+                    stat(
+                      'Current start',
+                      '${load.currentQty.toStringAsFixed(0)} ${load.unitLabel}',
+                    ),
+                    stat(
+                      load.unit == 'L' ? 'Target spray' : 'Target rate',
+                      '${load.targetRatePerHa.toStringAsFixed(0)} ${load.rateUnitLabel}',
+                    ),
+                    if (load.targetProductRatePerHa != null &&
+                        load.targetProductRatePerHa! > 0)
+                      stat(
+                        'Target product',
+                        '${load.targetProductRatePerHa!.toStringAsFixed(0)} kg/ha',
+                      ),
+                    if (plannedQty != null)
+                      stat(
+                        'This job (spray)',
+                        '${plannedQty.toStringAsFixed(0)} ${load.unitLabel}',
+                      ),
+                    if (load.targetProductRatePerHa != null &&
+                        load.targetProductRatePerHa! > 0 &&
+                        appliedHa > 0)
+                      stat(
+                        'This job (product)',
+                        '${(load.targetProductRatePerHa! * appliedHa).toStringAsFixed(0)} kg',
+                      ),
+                    stat(
+                      'Start reading',
+                      '${load.startQty.toStringAsFixed(0)} ${load.unitLabel}',
+                    ),
+                    if (load.productLoadedKg != null &&
+                        load.productLoadedKg! > 0)
+                      stat(
+                        'Product loaded',
+                        '${load.productLoadedKg!.toStringAsFixed(0)} kg',
+                      ),
+                    stat(
+                      'Load so far',
+                      '${load.jobs.length} jobs · ${_areaText(load.totalAppliedHa)}',
+                    ),
+                  ],
+                ),
+              ],
+              if (closedStats != null) ...[
+                const SizedBox(height: 10),
+                Text(
+                  '${closedStats.displayName} (allocated)',
+                  style: TextStyle(
+                    fontWeight: FontWeight.w700,
+                    fontSize: 13,
+                    color: scheme.onSecondaryContainer,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Wrap(
+                  spacing: 16,
+                  runSpacing: 6,
+                  children: [
+                    stat(
+                      'Rate',
+                      '${closedStats.ratePerHa.toStringAsFixed(0)} ${closedStats.recordUnitLabel}/ha',
+                    ),
+                    stat(
+                      'Amount',
+                      '${closedStats.amount.toStringAsFixed(0)} ${closedStats.recordUnitLabel}',
+                    ),
+                    if (closedStats.carrierRatePerHa != null)
+                      stat(
+                        'Spray rate',
+                        '${closedStats.carrierRatePerHa!.toStringAsFixed(0)} L/ha',
+                      ),
+                    if (closedStats.carrierAmount != null)
+                      stat(
+                        'Spray amount',
+                        '${closedStats.carrierAmount!.toStringAsFixed(0)} L',
+                      ),
+                  ],
+                ),
+              ],
               const SizedBox(height: 6),
               Text(
                 '${_formatDayHeader(DateTime(j.startedAt.year, j.startedAt.month, j.startedAt.day))}  ${_formatTime(j.startedAt)} – ${_formatTime(j.endedAt)}',
@@ -3857,34 +4511,400 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       jobSwathWidthM: _jobSwathWidthM,
       formatDayHeader: _formatDayHeader,
       formatTime: _formatTime,
+      productStatsByJobId: _productStatsByJobId,
     );
   }
 
   Future<void> _showPaddockHistory(String paddockName) async {
     final summaries = await JobStore.listJobSummaries();
-    final rows = summaries
+    final allRows = summaries
         .where((j) => j.paddockNames.contains(paddockName))
-        .toList();
+        .toList()
+      ..sort((a, b) => b.startedAt.compareTo(a.startedAt));
+
+    double paddockAreaHa = 0;
+    for (final p in _paddocks) {
+      if (p.name == paddockName) {
+        paddockAreaHa = p.areaHa;
+        break;
+      }
+    }
 
     if (!mounted) return;
     // ignore: use_build_context_synchronously
-    showModalBottomSheet(
+    showFadeModalBottomSheet(
       context: context,
       showDragHandle: true,
+      isScrollControlled: true,
       builder: (ctx) {
-        if (rows.isEmpty) return const Padding(padding: EdgeInsets.all(16), child: Text('No history for this paddock.'));
-        return ListView.separated(
-          itemCount: rows.length,
-          separatorBuilder: (_, __) => const Divider(height: 1),
-          itemBuilder: (_, i) {
-            final j = rows[i];
-            return ListTile(
-              leading: const Icon(Icons.route),
-              title: Text(j.id),
-              subtitle: Text('Area: ${j.totalHa.toStringAsFixed(1)} ha  •  Applied: ${j.areaAppliedHaFor(_currentSwathWidthM()).toStringAsFixed(1)} ha  •  ${j.coveragePercentFor(_currentSwathWidthM()).toStringAsFixed(0)}%'),
-              onTap: () async {
-                Navigator.pop(ctx);
-                await _showHistoryJobsFromPaths([j.filePath]);
+        if (allRows.isEmpty) {
+          return const Padding(
+            padding: EdgeInsets.all(16),
+            child: Text('No history for this paddock.'),
+          );
+        }
+
+        DateTime? rangeStart;
+        DateTime? rangeEnd;
+        final selected = <String>{};
+        var selecting = false;
+        final swathM = _currentSwathWidthM();
+        final productStats = _productStatsByJobId;
+        final areaText = _areaText;
+        final formatDay = _formatDayHeader;
+
+        double shareFor(JobFileSummary j) => paddockJobShare(
+              paddockNames: j.paddockNames,
+              paddockName: paddockName,
+              jobTotalHa: j.totalHa,
+              paddockAreaHa: paddockAreaHa,
+            );
+
+        double appliedFor(JobFileSummary j) =>
+            j.areaAppliedHaFor(swathM) * shareFor(j);
+
+        double coverageFor(JobFileSummary j) {
+          final area = paddockAreaHa > 0 ? paddockAreaHa : j.totalHa;
+          if (area <= 0) return 0;
+          return (appliedFor(j) / area * 100).clamp(0, double.infinity);
+        }
+
+        bool inRange(JobFileSummary j) {
+          final day = DateTime(
+            j.startedAt.year,
+            j.startedAt.month,
+            j.startedAt.day,
+          );
+          if (rangeStart != null && day.isBefore(rangeStart!)) return false;
+          if (rangeEnd != null && day.isAfter(rangeEnd!)) return false;
+          return true;
+        }
+
+        return StatefulBuilder(
+          builder: (ctx, setLocal) {
+            final rows = allRows.where(inRange).toList();
+            final tallyRows = selecting && selected.isNotEmpty
+                ? rows.where((j) => selected.contains(j.filePath)).toList()
+                : rows;
+
+            final totalApplied =
+                tallyRows.fold(0.0, (s, j) => s + appliedFor(j));
+            final coverageArea = paddockAreaHa > 0 ? paddockAreaHa : 0.0;
+            final coveragePct = coverageArea > 0
+                ? (totalApplied / coverageArea * 100).clamp(0, double.infinity)
+                : 0.0;
+
+            // Product totals keyed by name + record unit.
+            final productTotals = <String, ({double amount, double appliedHa, String unit, String? name})>{};
+            for (final j in tallyRows) {
+              final stats = productStats[j.id];
+              if (stats == null) continue;
+              final share = shareFor(j);
+              if (share <= 0) continue;
+              final key =
+                  '${stats.displayName}|${stats.recordUnitLabel}';
+              final prev = productTotals[key];
+              final amt = stats.amount * share;
+              final ha = appliedFor(j);
+              if (prev == null) {
+                productTotals[key] = (
+                  amount: amt,
+                  appliedHa: ha,
+                  unit: stats.recordUnitLabel,
+                  name: stats.productName,
+                );
+              } else {
+                productTotals[key] = (
+                  amount: prev.amount + amt,
+                  appliedHa: prev.appliedHa + ha,
+                  unit: prev.unit,
+                  name: prev.name,
+                );
+              }
+            }
+
+            Future<void> pickStart() async {
+              final picked = await showDatePicker(
+                context: ctx,
+                initialDate: rangeStart ?? allRows.first.startedAt,
+                firstDate: DateTime(
+                  allRows.last.startedAt.year,
+                  allRows.last.startedAt.month,
+                  allRows.last.startedAt.day,
+                ),
+                lastDate: DateTime(
+                  allRows.first.startedAt.year,
+                  allRows.first.startedAt.month,
+                  allRows.first.startedAt.day,
+                ),
+              );
+              if (picked == null) return;
+              setLocal(() {
+                rangeStart = DateTime(picked.year, picked.month, picked.day);
+                if (rangeEnd != null && rangeEnd!.isBefore(rangeStart!)) {
+                  rangeEnd = rangeStart;
+                }
+              });
+            }
+
+            Future<void> pickEnd() async {
+              final first = rangeStart ??
+                  DateTime(
+                    allRows.last.startedAt.year,
+                    allRows.last.startedAt.month,
+                    allRows.last.startedAt.day,
+                  );
+              final picked = await showDatePicker(
+                context: ctx,
+                initialDate: rangeEnd ?? (rangeStart ?? allRows.first.startedAt),
+                firstDate: first,
+                lastDate: DateTime(
+                  allRows.first.startedAt.year,
+                  allRows.first.startedAt.month,
+                  allRows.first.startedAt.day,
+                ),
+              );
+              if (picked == null) return;
+              setLocal(() {
+                rangeEnd = DateTime(picked.year, picked.month, picked.day);
+              });
+            }
+
+            return LayoutBuilder(
+              builder: (ctx, constraints) {
+                final h = constraints.maxHeight.isFinite &&
+                        constraints.maxHeight > 0
+                    ? constraints.maxHeight
+                    : MediaQuery.of(ctx).size.height * 0.7;
+                return SizedBox(
+                  height: h,
+                  child: Column(
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 4, 8, 0),
+                    child: Row(
+                      children: [
+                        Expanded(
+                          child: Text(
+                            paddockName,
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w700,
+                              fontSize: 18,
+                            ),
+                          ),
+                        ),
+                        if (selecting)
+                          TextButton(
+                            onPressed: () => setLocal(() {
+                              selecting = false;
+                              selected.clear();
+                            }),
+                            child: const Text('Done'),
+                          )
+                        else
+                          TextButton(
+                            onPressed: () => setLocal(() => selecting = true),
+                            child: const Text('Select'),
+                          ),
+                      ],
+                    ),
+                  ),
+                  if (paddockAreaHa > 0)
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 0, 16, 4),
+                      child: Text(
+                        'Paddock area ${areaText(paddockAreaHa)}',
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: Theme.of(ctx).colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    ),
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(12, 4, 12, 8),
+                    child: Wrap(
+                      spacing: 8,
+                      runSpacing: 8,
+                      crossAxisAlignment: WrapCrossAlignment.center,
+                      children: [
+                        ActionChip(
+                          label: Text(
+                            rangeStart == null
+                                ? 'From date'
+                                : 'From ${formatDay(rangeStart!)}',
+                          ),
+                          onPressed: pickStart,
+                        ),
+                        ActionChip(
+                          label: Text(
+                            rangeEnd == null
+                                ? 'To date'
+                                : 'To ${formatDay(rangeEnd!)}',
+                          ),
+                          onPressed: pickEnd,
+                        ),
+                        if (rangeStart != null || rangeEnd != null)
+                          TextButton(
+                            onPressed: () => setLocal(() {
+                              rangeStart = null;
+                              rangeEnd = null;
+                            }),
+                            child: const Text('Clear dates'),
+                          ),
+                      ],
+                    ),
+                  ),
+                  Material(
+                    color: Theme.of(ctx)
+                        .colorScheme
+                        .surfaceContainerHighest
+                        .withOpacity(0.55),
+                    child: Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            selecting && selected.isNotEmpty
+                                ? '${selected.length} selected'
+                                : '${rows.length} job${rows.length == 1 ? '' : 's'}',
+                            style: const TextStyle(
+                              fontWeight: FontWeight.w600,
+                              fontSize: 13,
+                            ),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            'Applied ${areaText(totalApplied)}'
+                            '${coverageArea > 0 ? '  ·  ${coveragePct.toStringAsFixed(0)}% of paddock' : ''}',
+                            style: const TextStyle(fontSize: 13),
+                          ),
+                          if (productTotals.isNotEmpty) ...[
+                            const SizedBox(height: 6),
+                            ...productTotals.values.map((p) {
+                              final rate = p.appliedHa > 0
+                                  ? p.amount / p.appliedHa
+                                  : 0.0;
+                              final label = (p.name != null &&
+                                      p.name!.trim().isNotEmpty)
+                                  ? p.name!
+                                  : 'Product';
+                              return Text(
+                                '$label  ${rate.toStringAsFixed(0)} ${p.unit}/ha · ${p.amount.toStringAsFixed(0)} ${p.unit}',
+                                style: const TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              );
+                            }),
+                          ],
+                          if (selecting && selected.isNotEmpty) ...[
+                            const SizedBox(height: 8),
+                            Wrap(
+                              spacing: 4,
+                              children: [
+                                IconButton(
+                                  tooltip: 'Show on map',
+                                  onPressed: () {
+                                    Navigator.pop(ctx);
+                                    _showHistoryJobsFromPaths(
+                                      selected.toList(),
+                                    );
+                                  },
+                                  icon: const Icon(Icons.map_outlined),
+                                ),
+                                TextButton(
+                                  onPressed: () => setLocal(() {
+                                    selected
+                                      ..clear()
+                                      ..addAll(rows.map((e) => e.filePath));
+                                  }),
+                                  child: const Text('All'),
+                                ),
+                                TextButton(
+                                  onPressed: () =>
+                                      setLocal(() => selected.clear()),
+                                  child: const Text('None'),
+                                ),
+                              ],
+                            ),
+                          ],
+                        ],
+                      ),
+                    ),
+                  ),
+                  const Divider(height: 1),
+                  Expanded(
+                    child: rows.isEmpty
+                        ? const Center(child: Text('No jobs in this date range.'))
+                        : ListView.separated(
+                            itemCount: rows.length,
+                            separatorBuilder: (_, __) =>
+                                const Divider(height: 1),
+                            itemBuilder: (_, i) {
+                              final j = rows[i];
+                              final isSel = selected.contains(j.filePath);
+                              final product = productStats[j.id];
+                              final day = DateTime(
+                                j.startedAt.year,
+                                j.startedAt.month,
+                                j.startedAt.day,
+                              );
+                              return ListTile(
+                                leading: selecting
+                                    ? Checkbox(
+                                        value: isSel,
+                                        onChanged: (_) => setLocal(() {
+                                          if (isSel) {
+                                            selected.remove(j.filePath);
+                                          } else {
+                                            selected.add(j.filePath);
+                                          }
+                                        }),
+                                      )
+                                    : const Icon(Icons.route),
+                                title: Text(
+                                  '${formatDay(day)}  ${_formatTime(j.startedAt)}',
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                    fontSize: 14,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  [
+                                    'Applied ${areaText(appliedFor(j))}',
+                                    '${coverageFor(j).toStringAsFixed(0)}%',
+                                    if (j.paddockNames.length > 1)
+                                      'share of ${j.paddockNames.length} paddocks',
+                                    if (product != null) product.shortLabel,
+                                  ].join('  ·  '),
+                                ),
+                                onTap: () {
+                                  if (selecting) {
+                                    setLocal(() {
+                                      if (isSel) {
+                                        selected.remove(j.filePath);
+                                      } else {
+                                        selected.add(j.filePath);
+                                      }
+                                    });
+                                    return;
+                                  }
+                                  Navigator.pop(ctx);
+                                  _showHistoryJobsFromPaths([j.filePath]);
+                                },
+                                onLongPress: () => setLocal(() {
+                                  selecting = true;
+                                  selected.add(j.filePath);
+                                }),
+                              );
+                            },
+                          ),
+                  ),
+                ],
+              ),
+                );
               },
             );
           },
@@ -4046,10 +5066,18 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 });
                 _rebuildPaddockLayers();
                 _runAfterMapFrame(() {
-                  _applyMapRotation(0);
                   if (_followGps && _dispPos != null) {
-                    _mapController.move(_dispPos!, _mapController.camera.zoom);
-                    _lastCameraTarget = _dispPos;
+                    final hdg = _rotationMode == RotationMode.travelUp
+                        ? _tractorHeadingDeg()
+                        : null;
+                    _swoopCamera(
+                      center: _dispPos,
+                      rotationDeg: hdg != null
+                          ? -hdg
+                          : (_rotationMode == RotationMode.northUp ? 0 : null),
+                    );
+                  } else {
+                    _applyMapRotation(0);
                   }
                 });
               },
@@ -4354,16 +5382,22 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           ),
 
           // Follow GPS button (shown after user pans away)
-          if (_showFollowGpsButton)
-            Positioned(
-              right: _fabEdge,
-              top: topChromeInset + _fabSecondaryDiameter + _fabGap,
-              child: _fatRoundActionButton(
-                icon: Icons.my_location,
-                diameter: _fabSecondaryDiameter,
-                onPressed: _recenter,
-              ),
+          Positioned(
+            right: _fabEdge,
+            top: topChromeInset + _fabSecondaryDiameter + _fabGap,
+            child: FadeSwap(
+              child: _showFollowGpsButton
+                  ? KeyedSubtree(
+                      key: const ValueKey('follow-gps'),
+                      child: _fatRoundActionButton(
+                        icon: Icons.my_location,
+                        diameter: _fabSecondaryDiameter,
+                        onPressed: _recenter,
+                      ),
+                    )
+                  : null,
             ),
+          ),
 
           // A/B buttons (bottom-right)
           if (_navMode && _pointA == null && _dispPos != null)
@@ -4427,21 +5461,37 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           ],
 
           // Completed job summary (top — keeps bottom controls clear)
-          if (_completedJobSummary != null &&
-              !_navMode &&
-              !_editorMode &&
-              !_showingHistory)
-            Positioned(
-              top: 0, left: 0, right: 0,
-              child: _completedJobSummaryPanel(),
+          Positioned(
+            top: 0,
+            left: 0,
+            right: 0,
+            child: FadeSwap(
+              child: (_completedJobSummary != null &&
+                      !_navMode &&
+                      !_editorMode &&
+                      !_showingHistory)
+                  ? KeyedSubtree(
+                      key: ValueKey('job-summary-${_completedJobSummary!.id}'),
+                      child: _completedJobSummaryPanel(),
+                    )
+                  : null,
             ),
+          ),
 
           // Historic job data panel
-          if (_showingHistory && _activeHistoryJobs.isNotEmpty)
-            Positioned(
-              left: 0, right: 0, bottom: 0,
-              child: _historyJobPanel(),
+          Positioned(
+            left: 0,
+            right: 0,
+            bottom: 0,
+            child: FadeSwap(
+              child: (_showingHistory && _activeHistoryJobs.isNotEmpty)
+                  ? KeyedSubtree(
+                      key: const ValueKey('history-panel'),
+                      child: _historyJobPanel(),
+                    )
+                  : null,
             ),
+          ),
         ],
       ),
       ),
@@ -4506,6 +5556,7 @@ class _HistoryJobPanel extends StatefulWidget {
   final double Function(SavedJob job) jobSwathWidthM;
   final String Function(DateTime day) formatDayHeader;
   final String Function(DateTime t) formatTime;
+  final Map<String, JobProductStats> productStatsByJobId;
 
   const _HistoryJobPanel({
     required this.jobs,
@@ -4519,6 +5570,7 @@ class _HistoryJobPanel extends StatefulWidget {
     required this.jobSwathWidthM,
     required this.formatDayHeader,
     required this.formatTime,
+    required this.productStatsByJobId,
   });
 
   @override
@@ -4607,9 +5659,12 @@ class _HistoryJobPanelState extends State<_HistoryJobPanel> with TickerProviderS
 
     _mapPanCtrl = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 450),
+      duration: const Duration(milliseconds: 480),
     );
-    final curved = CurvedAnimation(parent: _mapPanCtrl!, curve: Curves.easeInOut);
+    final curved = CurvedAnimation(
+      parent: _mapPanCtrl!,
+      curve: Curves.easeInOutCubic,
+    );
     curved.addListener(() {
       final t = curved.value;
       widget.mapController.move(
@@ -4699,6 +5754,11 @@ class _HistoryJobPanelState extends State<_HistoryJobPanel> with TickerProviderS
                             _historyStat('Applied', widget.areaText(widget.jobAreaAppliedHa(j))),
                             _historyStat('Coverage', '${widget.jobCoveragePercent(j).toStringAsFixed(0)}%'),
                             _historyStat('Swath', widget.jobSwathWidthText(j)),
+                            if (widget.productStatsByJobId[j.id] != null)
+                              _historyStat(
+                                'Product',
+                                widget.productStatsByJobId[j.id]!.shortLabel,
+                              ),
                           ],
                         ),
                         const SizedBox(height: 4),

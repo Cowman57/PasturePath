@@ -41,7 +41,7 @@ class JobFileSummary {
       totalHa: job.totalHa,
       avgSpeedKph: job.avgSpeedKph,
       swathWidthM: job.swathWidthM,
-      pathDistanceM: job.pathDistanceM,
+      pathDistanceM: job.effectiveAppliedDistanceM,
       swathWidthSetting: job.swathWidthSetting,
       unitsAtSave: job.unitsAtSave,
       hasSavedSwathWidth: job.hasSavedSwathWidth,
@@ -51,6 +51,22 @@ class JobFileSummary {
   factory JobFileSummary.fromJson(String filePath, Map<String, dynamic> j) {
     final hasSaved = j['hasSavedSwathWidth'] == true ||
         j['swathWidthSetting'] != null;
+    var pathDist = (j['pathDistanceM'] as num?)?.toDouble() ?? 0;
+    final rawPath = j['path'];
+    if (rawPath is List && rawPath.length >= 2) {
+      final pts = <LatLng>[];
+      for (final m in rawPath) {
+        if (m is Map) {
+          pts.add(LatLng(
+            (m['lat'] as num).toDouble(),
+            (m['lng'] as num).toDouble(),
+          ));
+        }
+      }
+      if (pts.length >= 2) {
+        pathDist = sanitizeAppliedPathDistanceM(pathDist, pts);
+      }
+    }
     return JobFileSummary(
       filePath: filePath,
       id: j['id'] as String,
@@ -60,7 +76,7 @@ class JobFileSummary {
       totalHa: (j['totalHa'] as num).toDouble(),
       avgSpeedKph: (j['avgSpeedKph'] as num).toDouble(),
       swathWidthM: (j['swathWidthM'] as num?)?.toDouble(),
-      pathDistanceM: (j['pathDistanceM'] as num?)?.toDouble() ?? 0,
+      pathDistanceM: pathDist,
       swathWidthSetting: (j['swathWidthSetting'] as num?)?.toDouble(),
       unitsAtSave: j['unitsAtSave'] as String?,
       hasSavedSwathWidth: hasSaved,
@@ -140,7 +156,7 @@ class SavedJob {
   });
 
   double get effectiveAppliedDistanceM =>
-      pathDistanceM > 0 ? pathDistanceM : _swathApplicableDistanceM(path);
+      sanitizeAppliedPathDistanceM(pathDistanceM, path);
 
   /// Width in metres recorded with this job, if any.
   double? get storedSwathWidthM {
@@ -185,16 +201,6 @@ class SavedJob {
     'unitsAtSave': unitsAtSave,
     'hasSavedSwathWidth': hasSavedSwathWidth,
   };
-
-  static double _swathApplicableDistanceM(List<LatLng> path) {
-    if (path.length < 2) return 0;
-    double total = 0;
-    for (int i = 1; i < path.length; i++) {
-      final d = pathDistanceMeters([path[i - 1], path[i]]);
-      if (d >= 0.35 && d <= 40) total += d;
-    }
-    return total;
-  }
 
   static SavedJob fromJson(Map<String, dynamic> j) {
     final pts = <LatLng>[];

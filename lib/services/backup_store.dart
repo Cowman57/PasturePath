@@ -7,6 +7,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/job.dart';
 import 'job_store.dart';
+import 'load_session_store.dart';
 
 class BackupInfo {
   final String path;
@@ -109,6 +110,7 @@ class BackupStore {
       'settings': settings,
       if (farmJsonText != null) 'farmJson': farmJsonText,
       'jobs': jobs,
+      'loadSessions': await LoadSessionStore.exportForBackup(),
     };
 
     final internalPath = '${await backupsDir()}/${_internalBackupFileName(now)}';
@@ -280,6 +282,13 @@ class BackupStore {
       } catch (_) {
         // Meta is best-effort; listJobSummaries can still migrate later.
       }
+    }
+
+    final loadSessions = data['loadSessions'];
+    if (loadSessions is Map) {
+      await LoadSessionStore.importFromBackup(loadSessions.cast<String, dynamic>());
+    } else {
+      await LoadSessionStore.importFromBackup(null);
     }
 
     return BackupInfo(

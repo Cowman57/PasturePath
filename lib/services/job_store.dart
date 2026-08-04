@@ -52,13 +52,29 @@ class JobStore {
   }
 
   static Future<JobFileSummary> readSummary(String filePath) async {
-    final meta = io.File(metaPathFor(filePath));
-    if (await meta.exists()) {
-      final txt = await meta.readAsString();
-      return JobFileSummary.fromJson(filePath, jsonDecode(txt) as Map<String, dynamic>);
+    // Prefer full job so pathDistanceM is sanitized the same as map view.
+    try {
+      final job = await read(filePath);
+      final summary = JobFileSummary.fromSavedJob(job, filePath);
+      // Keep meta in sync for list views.
+      try {
+        await io.File(metaPathFor(filePath)).writeAsString(
+          jsonEncode(summary.toJson()),
+          flush: true,
+        );
+      } catch (_) {}
+      return summary;
+    } catch (_) {
+      final meta = io.File(metaPathFor(filePath));
+      if (await meta.exists()) {
+        final txt = await meta.readAsString();
+        return JobFileSummary.fromJson(
+          filePath,
+          jsonDecode(txt) as Map<String, dynamic>,
+        );
+      }
+      rethrow;
     }
-    final job = await read(filePath);
-    return JobFileSummary.fromSavedJob(job, filePath);
   }
 
   static Future<List<JobFileSummary>> listJobSummaries() async {
