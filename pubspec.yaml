@@ -19,6 +19,7 @@ dependencies:
   downloadsfolder: ^1.2.0
   flutter_map_dragmarker: ^6.0.0
   usb_serial: ^0.5.2
+  http: ^1.6.0
 
 
 dev_dependencies:

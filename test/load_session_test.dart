@@ -128,6 +128,26 @@ void main() {
       expect(s.amountForJob('b'), closeTo(300, 0.01));
       expect(s.currentQty, 1500);
     });
+    test('closeWithExpectedRemaining attributes pending at expected qty', () {
+      final s = LoadSession(
+        id: '1',
+        unit: 'kg',
+        startQty: 2000,
+        targetRatePerHa: 100,
+        startedAt: DateTime(2026, 8, 1),
+        jobs: [
+          const LoadSessionJobRef(jobId: 'a', appliedHa: 2.0, usedQty: 200),
+          const LoadSessionJobRef(jobId: 'b', appliedHa: 3.0),
+        ],
+      );
+      // current start after job a reading would be 1800; simulate that:
+      s.currentQty = 1800;
+      expect(s.expectedQtyNow, closeTo(1500, 0.01)); // 1800 - 100*3
+      s.closeWithExpectedRemaining();
+      expect(s.jobs[0].usedQty, closeTo(200, 0.01));
+      expect(s.jobs[1].usedQty, closeTo(300, 0.01));
+      expect(s.currentQty, closeTo(1500, 0.01));
+    });
   });
 
   group('paddockJobShare', () {
@@ -157,7 +177,7 @@ void main() {
   });
 
   group('JobProductStats', () {
-    test('shortLabel includes product name and spray rate when dissolved', () {
+    test('labels stay compact for history', () {
       const s = JobProductStats(
         amount: 120,
         ratePerHa: 30,
@@ -166,7 +186,8 @@ void main() {
         carrierAmount: 400,
         carrierRatePerHa: 100,
       );
-      expect(s.shortLabel, 'Urea 30 kg/ha · 120 kg (100 L/ha)');
+      expect(s.shortLabel, 'Urea 30 kg/ha');
+      expect(s.historyLabel, '30 kg/ha');
       expect(s.recordUnitLabel, 'kg');
     });
   });

@@ -246,6 +246,25 @@ class LoadSession {
     return unit == 'L' ? 'Spray' : 'Product';
   }
 
+  /// Primary target rate for operator records (product kg/ha when dissolved).
+  double get primaryTargetRatePerHa =>
+      (targetProductRatePerHa != null && targetProductRatePerHa! > 0)
+          ? targetProductRatePerHa!
+          : targetRatePerHa;
+
+  String get primaryTargetRateLabel {
+    if (targetProductRatePerHa != null && targetProductRatePerHa! > 0) {
+      return '${targetProductRatePerHa!.toStringAsFixed(0)} kg/ha';
+    }
+    return '${targetRatePerHa.toStringAsFixed(0)} $rateUnitLabel';
+  }
+
+  /// Close without a weighed reading: attribute pending jobs at expected remaining.
+  void closeWithExpectedRemaining() {
+    final expected = expectedQtyNow.clamp(0.0, currentQty);
+    applyReading(expected);
+  }
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'unit': unit,
@@ -354,14 +373,12 @@ class JobProductStats {
   String get shortLabel {
     final name = productName?.trim();
     final prefix = (name != null && name.isNotEmpty) ? '$name ' : '';
-    if (carrierAmount != null && carrierRatePerHa != null) {
-      return '$prefix${ratePerHa.toStringAsFixed(0)} kg/ha · '
-          '${amount.toStringAsFixed(0)} kg'
-          ' (${carrierRatePerHa!.toStringAsFixed(0)} L/ha)';
-    }
-    return '$prefix${ratePerHa.toStringAsFixed(0)} $unitLabel/ha · '
-        '${amount.toStringAsFixed(0)} $unitLabel';
+    return '$prefix${ratePerHa.toStringAsFixed(0)} $recordUnitLabel/ha';
   }
+
+  /// Compact history-table label (rate only).
+  String get historyLabel =>
+      '${ratePerHa.toStringAsFixed(0)} $recordUnitLabel/ha';
 }
 
 /// Applied ha helper matching job coverage math.

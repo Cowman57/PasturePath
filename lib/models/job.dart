@@ -1,5 +1,6 @@
 import 'package:latlong2/latlong.dart';
 import '../services/geometry.dart';
+import 'job_weather.dart';
 
 /// Lightweight job record for history lists (no GPS path).
 class JobFileSummary {
@@ -15,6 +16,7 @@ class JobFileSummary {
   final double? swathWidthSetting;
   final String? unitsAtSave;
   final bool hasSavedSwathWidth;
+  final JobWeather? weather;
 
   const JobFileSummary({
     required this.filePath,
@@ -29,6 +31,7 @@ class JobFileSummary {
     this.swathWidthSetting,
     this.unitsAtSave,
     this.hasSavedSwathWidth = false,
+    this.weather,
   });
 
   factory JobFileSummary.fromSavedJob(SavedJob job, String filePath) {
@@ -45,6 +48,7 @@ class JobFileSummary {
       swathWidthSetting: job.swathWidthSetting,
       unitsAtSave: job.unitsAtSave,
       hasSavedSwathWidth: job.hasSavedSwathWidth,
+      weather: job.weather,
     );
   }
 
@@ -67,6 +71,7 @@ class JobFileSummary {
         pathDist = sanitizeAppliedPathDistanceM(pathDist, pts);
       }
     }
+    final rawWeather = j['weather'];
     return JobFileSummary(
       filePath: filePath,
       id: j['id'] as String,
@@ -80,6 +85,9 @@ class JobFileSummary {
       swathWidthSetting: (j['swathWidthSetting'] as num?)?.toDouble(),
       unitsAtSave: j['unitsAtSave'] as String?,
       hasSavedSwathWidth: hasSaved,
+      weather: rawWeather is Map
+          ? JobWeather.fromJson(rawWeather.cast<String, dynamic>())
+          : null,
     );
   }
 
@@ -95,6 +103,7 @@ class JobFileSummary {
     'swathWidthSetting': swathWidthSetting,
     'unitsAtSave': unitsAtSave,
     'hasSavedSwathWidth': hasSavedSwathWidth,
+    if (weather != null) 'weather': weather!.toJson(),
   };
 
   double? get storedSwathWidthM {
@@ -138,6 +147,7 @@ class SavedJob {
   final double? swathWidthSetting; // width value in user units at job finish
   final String? unitsAtSave;       // 'meters' or 'feet' at job finish
   final bool hasSavedSwathWidth;   // true when width was persisted with the job
+  final JobWeather? weather;
 
   SavedJob({
     required this.id,
@@ -153,7 +163,25 @@ class SavedJob {
     this.swathWidthSetting,
     this.unitsAtSave,
     this.hasSavedSwathWidth = false,
+    this.weather,
   });
+
+  SavedJob copyWith({JobWeather? weather}) => SavedJob(
+        id: id,
+        startedAt: startedAt,
+        endedAt: endedAt,
+        path: path,
+        pathHeadingsDeg: pathHeadingsDeg,
+        paddockNames: paddockNames,
+        totalHa: totalHa,
+        avgSpeedKph: avgSpeedKph,
+        swathWidthM: swathWidthM,
+        pathDistanceM: pathDistanceM,
+        swathWidthSetting: swathWidthSetting,
+        unitsAtSave: unitsAtSave,
+        hasSavedSwathWidth: hasSavedSwathWidth,
+        weather: weather ?? this.weather,
+      );
 
   double get effectiveAppliedDistanceM =>
       sanitizeAppliedPathDistanceM(pathDistanceM, path);
@@ -200,6 +228,7 @@ class SavedJob {
     'swathWidthSetting': swathWidthSetting,
     'unitsAtSave': unitsAtSave,
     'hasSavedSwathWidth': hasSavedSwathWidth,
+    if (weather != null) 'weather': weather!.toJson(),
   };
 
   static SavedJob fromJson(Map<String, dynamic> j) {
@@ -221,6 +250,7 @@ class SavedJob {
         j['swathWidthSetting'] != null;
 
     final pathDist = (j['pathDistanceM'] as num?)?.toDouble() ?? 0;
+    final rawWeather = j['weather'];
 
     return SavedJob(
       id: j['id'] as String,
@@ -236,6 +266,9 @@ class SavedJob {
       swathWidthSetting: (j['swathWidthSetting'] as num?)?.toDouble(),
       unitsAtSave: j['unitsAtSave'] as String?,
       hasSavedSwathWidth: hasSaved,
+      weather: rawWeather is Map
+          ? JobWeather.fromJson(rawWeather.cast<String, dynamic>())
+          : null,
     );
   }
 }

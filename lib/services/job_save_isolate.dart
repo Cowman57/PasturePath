@@ -66,7 +66,7 @@ double _sanitizePathDistanceM(double storedM, dynamic rawPath) {
   final geom = _pathGeomM(rawPath);
   if (storedM <= 0) return geom;
   if (geom <= 0) return storedM;
-  if (storedM > geom * 1.35) return geom;
+  if (storedM > geom * 1.15) return geom;
   return storedM;
 }
 
@@ -87,6 +87,7 @@ Map<String, dynamic> _summaryMapFromJobJson(Map<String, dynamic> j) {
     'swathWidthSetting': j['swathWidthSetting'],
     'unitsAtSave': j['unitsAtSave'],
     'hasSavedSwathWidth': hasSaved,
+    if (j['weather'] != null) 'weather': j['weather'],
   };
 }
 

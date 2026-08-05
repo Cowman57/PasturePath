@@ -155,10 +155,35 @@ class LoadSessionStore {
     return closed;
   }
 
-  /// Cancel an open load without recording an end reading (discards session jobs link).
-  static Future<void> cancelOpen() async {
+  /// Finish an open load using expected remaining as the final scale reading.
+  /// Keeps rates already recorded from mid-load weigh-ins.
+  static Future<LoadSession> closeWithExpected() async {
     final open = await openSession();
-    if (open == null) return;
+    if (open == null) {
+      throw StateError('No open product load');
+    }
+    open.closeWithExpectedRemaining();
+    final endQty = open.currentQty;
+    final closed = open.copyWith(
+      currentQty: endQty,
+      endQty: endQty,
+      endedAt: DateTime.now(),
+      jobs: List<LoadSessionJobRef>.from(open.jobs),
+    );
+    await _upsert(closed, keepOpen: false);
+    return closed;
+  }
+
+  /// Cancel an open load. Prefer [closeWithExpected] so mid-load rates are kept.
+  /// Hard-delete only when there are no jobs attached.
+  static Future<LoadSession?> cancelOpen({bool forceDiscard = false}) async {
+    final open = await openSession();
+    if (open == null) return null;
+
+    if (!forceDiscard && open.jobs.isNotEmpty) {
+      return closeWithExpected();
+    }
+
     final root = await _readRoot();
     final sessions = (root['sessions'] is List)
         ? List<dynamic>.from(root['sessions'] as List)
@@ -167,6 +192,7 @@ class LoadSessionStore {
     root['sessions'] = sessions;
     root['openSessionId'] = null;
     await _writeRoot(root);
+    return null;
   }
 
   static Future<void> _upsert(LoadSession session, {required bool keepOpen}) async {

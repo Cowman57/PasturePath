@@ -128,14 +128,15 @@ double pathDistanceMeters(List<LatLng> path) {
 }
 
 /// Prefer stored applied metres, but fall back to path geometry when stored
-/// length is clearly inflated (boom zig-zag / dual-fix counting).
+/// length is clearly inflated (legacy boom zig-zag / dual-fix counting).
 ///
-/// Overlap passes remain in [path], so using path length still counts them.
+/// New jobs store paddock-gated simplified path length, which should already
+/// match geometry; this mainly corrects older inflated files.
 double sanitizeAppliedPathDistanceM(double storedM, List<LatLng> path) {
   final geom = pathDistanceMeters(path);
   if (storedM <= 0) return geom;
   if (geom <= 0) return storedM;
-  if (storedM > geom * 1.35) return geom;
+  if (storedM > geom * 1.15) return geom;
   return storedM;
 }
 
