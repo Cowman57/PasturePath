@@ -109,6 +109,7 @@ class LoadSessionStore {
   static Future<LoadSession?> attachJob({
     required String jobId,
     required double appliedHa,
+    double? paddockHa,
   }) async {
     final open = await openSession();
     if (open == null) return null;
@@ -117,7 +118,11 @@ class LoadSessionStore {
     // Avoid duplicate attach of the same job id.
     if (open.jobs.any((j) => j.jobId == jobId)) return open;
 
-    open.jobs.add(LoadSessionJobRef(jobId: jobId, appliedHa: appliedHa));
+    open.jobs.add(LoadSessionJobRef(
+      jobId: jobId,
+      appliedHa: appliedHa,
+      paddockHa: (paddockHa != null && paddockHa > 0) ? paddockHa : null,
+    ));
     await _upsert(open, keepOpen: true);
     return open;
   }
