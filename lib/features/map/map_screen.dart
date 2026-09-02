@@ -41,6 +41,10 @@ import '../../widgets/navigation_arrow_icon.dart';
 import '../../widgets/work_list_sheet.dart';
 import 'tool_setup_tab.dart';
 
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:http/http.dart' as http;
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 /// Paddock editor sub-state while [_MapScreenState._editorMode] is true.
 enum EditorTool { browse, drawOuter, drawHole, edit }
 
@@ -144,6 +148,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   // nav
   bool _navMode = false;
+  static const _pipChannel = MethodChannel('pasturepath/pip');
+  bool _inPipMode = false;
   LatLng? _pointA;
   LatLng? _pointB;
   /// Parallel guidance lines — each entry is one swath line (may be clipped to segments).
@@ -690,6 +696,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    _gpsInput.addListener(_onGpsInputChanged);
+
+    _pipChannel.setMethodCallHandler((call) async {
+      if (call.method == 'pipModeChanged') {
+        final args = call.arguments as Map;
+        final inPip = args['inPip'] as bool;
+        if (mounted) setState(() => _inPipMode = inPip);
+      }
+    });
     // Smooth pulsing animation for chevrons
     _chevCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
       ..repeat();
@@ -757,6 +772,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _completedReadingCtrl?.dispose();
     _chevCtrl.dispose();
     _drawerTabCtrl.dispose();
+    _inPipMode = false;
+    _gpsInput.removeListener(_onGpsInputChanged);
+    WakelockPlus.disable();
+    _setPipEnabled(false);
     super.dispose();
   }
 
@@ -1842,6 +1861,22 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _dispHeadingNotifier.value = _tractorHeadingDeg();
   }
 
+
+  void _onGpsInputChanged() {
+    _updateWakeLock();
+  }
+
+  void _updateWakeLock() {
+    if (_navMode || _gpsInput.isUsbActive) {
+      WakelockPlus.enable();
+    } else {
+      WakelockPlus.disable();
+    }
+  }
+
+  void _setPipEnabled(bool enabled) {
+    _pipChannel.invokeMethod('setPipEnabled', {'enabled': enabled});
+  }
   void _onGpsSmoothTick(Duration elapsed) {
     if (!mounted || _gpsSmoothness <= 0) return;
 
@@ -2464,8 +2499,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                         setState(() {
                           _selectedIdx.clear();
                           _editorSelecting = false;
-                        });
-                        _rebuildPaddockLayers();
+    });
+    _updateWakeLock();
+    _setPipEnabled(false);
+    _rebuildPaddockLayers();
                       } else {
                         _editorSelectAll();
                       }
@@ -4079,6 +4116,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _rotationMode = RotationMode.travelUp;
       _followGps = true;
     });
+    _updateWakeLock();
+    _setPipEnabled(true);
+    _rebuildPaddockLayers();
 
     if (_mapReady && _dispPos != null) {
       final hdg = _tractorHeadingDeg();
@@ -4577,6 +4617,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             );
           },
         ),
+        const Divider(),
+        const ListTile(title: Text('About', style: TextStyle(fontWeight: FontWeight.bold))),
+        _AppVersionTile(),
       ],
         );
       },
@@ -5608,6 +5651,25 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
+    if (_navMode && _inPipMode) {
+      return Material(
+        type: MaterialType.transparency,
+        color: Colors.black,
+        child: Center(
+          child: ValueListenableBuilder<double>(
+            valueListenable: _signedErrorNotifier,
+            builder: (context, signedErrorM, _) => _ErrorChevronHud(
+              signedErrorM: signedErrorM,
+              chevronsPerSide: 2,
+              controller: _chevCtrl,
+              rowWidthMeters: _toMeters(_width <= 0 ? 3.0 : _width),
+              pipMode: true,
+            ),
+          ),
+        ),
+      );
+    }
+
     final safe = MediaQuery.of(context).padding;
     final startCenter = _dispPos ?? _currentPos ?? const LatLng(-37.6710, 175.6860);
 
@@ -6716,12 +6778,14 @@ class _ErrorChevronHud extends StatelessWidget {
   final int chevronsPerSide;
   final AnimationController controller;
   final double rowWidthMeters;
+  final bool pipMode;
 
   const _ErrorChevronHud({
     required this.signedErrorM,
     required this.chevronsPerSide,
     required this.controller,
     required this.rowWidthMeters,
+    this.pipMode = false,
   });
 
   Color _gradColorFromCenter(int idxFromCenter, int total) {
@@ -6973,6 +7037,78 @@ class _CacheMapDialogState extends State<_CacheMapDialog> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _AppVersionTile extends StatefulWidget {
+  @override
+  State<_AppVersionTile> createState() => _AppVersionTileState();
+}
+
+class _AppVersionTileState extends State<_AppVersionTile> {
+  String? _latestVersion;
+  bool _loading = true;
+  String? _error;
+  static const _repoUrl = 'https://github.com/anomalyco/PasturePath';
+  static const _releasesUrl = '$_repoUrl/releases';
+  static const _apiUrl = '$_repoUrl/releases/latest';
+
+  @override
+  void initState() {
+    super.initState();
+    _checkUpdate();
+  }
+
+  Future<void> _checkUpdate() async {
+    try {
+      final uri = Uri.parse(_apiUrl);
+      final resp = await http.get(uri, headers: {'Accept': 'application/json'});
+      if (resp.statusCode != 200) {
+        if (mounted) setState(() { _loading = false; _error = 'Check failed (${resp.statusCode})'; });
+        return;
+      }
+      final data = json.decode(resp.body) as Map;
+      final tag = data['tag_name'] as String?;
+      if (mounted) setState(() { _latestVersion = tag; _loading = false; });
+    } catch (e) {
+      if (mounted) setState(() { _loading = false; _error = e.toString(); });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<PackageInfo>(
+      future: PackageInfo.fromPlatform(),
+      builder: (context, snap) {
+        final version = snap.data?.version ?? '—';
+        final buildNumber = snap.data?.buildNumber ?? '—';
+        final currentVersion = 'v$version+$buildNumber';
+        final currentTag = 'v$version';
+
+        String subtitle;
+        Widget? trailing;
+
+        if (_loading) {
+          subtitle = 'Checking for updates…';
+        } else if (_error != null) {
+          subtitle = currentVersion;
+        } else if (_latestVersion != null && _latestVersion != currentTag) {
+          subtitle = '$currentVersion → $_latestVersion available';
+          trailing = TextButton(
+            onPressed: () => launchUrl(Uri.parse(_releasesUrl), mode: LaunchMode.externalApplication),
+            child: const Text('Update'),
+          );
+        } else {
+          subtitle = '$currentVersion (up to date)';
+        }
+
+        return ListTile(
+          title: const Text('PasturePath'),
+          subtitle: Text(subtitle),
+          trailing: trailing,
+        );
+      },
     );
   }
 }

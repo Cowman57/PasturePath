@@ -31,6 +31,10 @@ android {
     }
 
     buildTypes {
+        debug {
+            applicationIdSuffix = ".debug"
+            resValue("string", "app_name", "PasturePath (Debug)")
+        }
         release {
             // TODO: Add your own signing config for the release build.
             // Signing with the debug keys for now, so `flutter run --release` works.
@@ -41,4 +45,19 @@ android {
 
 flutter {
     source = "../.."
+}
+
+// Flutter still reports app-release.apk; also copy PasturePath-<version>.apk
+android.applicationVariants.configureEach {
+    val version = versionName
+    val mode = buildType.name
+    assembleProvider.configure {
+        doLast {
+            val dir = layout.buildDirectory.get().asFile.resolve("outputs/flutter-apk")
+            val src = dir.resolve("app-$mode.apk")
+            if (src.exists() && !version.isNullOrBlank()) {
+                src.copyTo(dir.resolve("PasturePath-$version.apk"), overwrite = true)
+            }
+        }
+    }
 }
