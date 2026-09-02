@@ -3,21 +3,36 @@ class LoadSessionJobRef {
   const LoadSessionJobRef({
     required this.jobId,
     required this.appliedHa,
+    this.paddockHa,
     this.usedQty,
   });
 
   final String jobId;
+
+  /// Swath area actually covered (ha). Used for coverage / speed advice.
   final double appliedHa;
+
+  /// Paddock given area (ha) this job belongs to. Rate and expected remaining
+  /// use this so leaving a paddock mid-job does not shrink the denominator.
+  final double? paddockHa;
 
   /// Carrier used for this job from a scale reading (kg or L).
   /// Null until a reading attributes usage to this job.
   final double? usedQty;
+
+  /// Area the recorded rate applies to: paddock given area when known.
+  double get rateAreaHa {
+    final given = paddockHa;
+    if (given != null && given > 0) return given;
+    return appliedHa > 0 ? appliedHa : 0;
+  }
 
   bool get hasReading => usedQty != null;
 
   Map<String, dynamic> toJson() => {
         'jobId': jobId,
         'appliedHa': appliedHa,
+        if (paddockHa != null) 'paddockHa': paddockHa,
         if (usedQty != null) 'usedQty': usedQty,
       };
 
@@ -25,6 +40,7 @@ class LoadSessionJobRef {
     return LoadSessionJobRef(
       jobId: j['jobId'] as String? ?? '',
       appliedHa: (j['appliedHa'] as num?)?.toDouble() ?? 0,
+      paddockHa: (j['paddockHa'] as num?)?.toDouble(),
       usedQty: (j['usedQty'] as num?)?.toDouble(),
     );
   }
@@ -32,12 +48,14 @@ class LoadSessionJobRef {
   LoadSessionJobRef copyWith({
     String? jobId,
     double? appliedHa,
+    double? paddockHa,
     double? usedQty,
     bool clearUsedQty = false,
   }) {
     return LoadSessionJobRef(
       jobId: jobId ?? this.jobId,
       appliedHa: appliedHa ?? this.appliedHa,
+      paddockHa: paddockHa ?? this.paddockHa,
       usedQty: clearUsedQty ? null : (usedQty ?? this.usedQty),
     );
   }
@@ -97,12 +115,12 @@ class LoadSession {
   bool get isDissolved => unit == 'L' && (productLoadedKg ?? 0) > 0;
 
   double get totalAppliedHa =>
-      jobs.fold(0.0, (s, j) => s + (j.appliedHa > 0 ? j.appliedHa : 0));
+      jobs.fold(0.0, (s, j) => s + j.rateAreaHa);
 
   /// Ha on jobs not yet attributed a scale reading.
   double get pendingAppliedHa => jobs
       .where((j) => !j.hasReading)
-      .fold(0.0, (s, j) => s + (j.appliedHa > 0 ? j.appliedHa : 0));
+      .fold(0.0, (s, j) => s + j.rateAreaHa);
 
   /// Expected scales for the open segment (from [currentQty]).
   double expectedQtyForAppliedHa(double appliedHa) =>
@@ -160,7 +178,7 @@ class LoadSession {
 
     final pendingHa = pending.fold(
       0.0,
-      (s, j) => s + (j.appliedHa > 0 ? j.appliedHa : 0),
+      (s, j) => s + j.rateAreaHa,
     );
 
     final lastPendingId = pending.last.jobId;
@@ -174,7 +192,7 @@ class LoadSession {
         }
         return j.copyWith(usedQty: 0);
       }
-      final share = j.appliedHa > 0 ? j.appliedHa / pendingHa : 0.0;
+      final share = j.rateAreaHa > 0 ? j.rateAreaHa / pendingHa : 0.0;
       return j.copyWith(usedQty: delta * share);
     }).toList();
   }
@@ -204,8 +222,8 @@ class LoadSession {
     final used = usedQty;
     final ha = totalAppliedHa;
     if (used == null || ha <= 0) return null;
-    if (match.appliedHa <= 0) return null;
-    return used * match.appliedHa / ha;
+    if (match.rateAreaHa <= 0) return null;
+    return used * match.rateAreaHa / ha;
   }
 
   double? productAmountForJob(String jobId) {
@@ -219,15 +237,15 @@ class LoadSession {
   double? rateForJob(String jobId) {
     final match = _job(jobId);
     final amount = amountForJob(jobId);
-    if (match == null || amount == null || match.appliedHa <= 0) return null;
-    return amount / match.appliedHa;
+    if (match == null || amount == null || match.rateAreaHa <= 0) return null;
+    return amount / match.rateAreaHa;
   }
 
   double? productRateForJob(String jobId) {
     final match = _job(jobId);
     final amount = productAmountForJob(jobId);
-    if (match == null || amount == null || match.appliedHa <= 0) return null;
-    return amount / match.appliedHa;
+    if (match == null || amount == null || match.rateAreaHa <= 0) return null;
+    return amount / match.rateAreaHa;
   }
 
   LoadSessionJobRef? _job(String jobId) {

@@ -1,7 +1,7 @@
 name: tractorgps
 description: PasturePath V4
 publish_to: "none"
-version: 4.0.0+1
+version: 4.1.1+1
 
 environment:
   sdk: ">=3.9.0 <4.0.0"
@@ -20,6 +20,9 @@ dependencies:
   flutter_map_dragmarker: ^6.0.0
   usb_serial: ^0.5.2
   http: ^1.6.0
+  wakelock_plus: ^1.5.2
+  package_info_plus: ^9.0.0
+  url_launcher: ^6.3.1
 
 
 dev_dependencies:

@@ -148,6 +148,38 @@ void main() {
       expect(s.jobs[1].usedQty, closeTo(300, 0.01));
       expect(s.currentQty, closeTo(1500, 0.01));
     });
+
+    test('rate uses paddock given area not covered swath', () {
+      final s = LoadSession(
+        id: '1',
+        unit: 'kg',
+        startQty: 2000,
+        targetRatePerHa: 100,
+        startedAt: DateTime(2026, 8, 1),
+        jobs: const [
+          LoadSessionJobRef(jobId: 'a', appliedHa: 2.0, paddockHa: 10.0),
+        ],
+      );
+      s.applyReading(1800); // used 200
+      expect(s.amountForJob('a'), closeTo(200, 0.01));
+      expect(s.rateForJob('a'), closeTo(20, 0.01)); // 200 / 10 ha paddock
+      expect(s.expectedQtyNow, closeTo(1800, 0.01));
+    });
+
+    test('expected remaining uses paddock area once a job is attached', () {
+      final s = LoadSession(
+        id: '1',
+        unit: 'kg',
+        startQty: 2000,
+        targetRatePerHa: 100,
+        startedAt: DateTime(2026, 8, 1),
+        jobs: const [
+          LoadSessionJobRef(jobId: 'a', appliedHa: 2.0, paddockHa: 10.0),
+        ],
+      );
+      expect(s.pendingAppliedHa, closeTo(10.0, 0.01));
+      expect(s.expectedQtyNow, closeTo(1000, 0.01)); // 2000 - 100*10
+    });
   });
 
   group('paddockJobShare', () {

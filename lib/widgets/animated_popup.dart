@@ -49,22 +49,24 @@ Future<T?> showFadeModalBottomSheet<T>({
     barrierColor: Colors.black54,
     transitionDuration: kPopupFadeDuration,
     pageBuilder: (ctx, anim, secondary) {
-      final maxH = MediaQuery.sizeOf(ctx).height * 0.75;
-      return Align(
-        alignment: Alignment.bottomCenter,
-        child: Material(
-          color: backgroundColor ?? Theme.of(ctx).colorScheme.surface,
-          borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
-          clipBehavior: Clip.antiAlias,
-          child: ConstrainedBox(
-            constraints: BoxConstraints(
-              maxHeight: maxH,
-              maxWidth: MediaQuery.sizeOf(ctx).width,
-            ),
-            child: SafeArea(
-              top: false,
+      final mq = MediaQuery.of(ctx);
+      final keyboard = mq.viewInsets.bottom;
+      final navBar = mq.viewPadding.bottom;
+      final available =
+          (mq.size.height - keyboard - navBar).clamp(200.0, mq.size.height);
+      final maxH = available * 0.88;
+      return Padding(
+        padding: EdgeInsets.only(bottom: keyboard + navBar),
+        child: Align(
+          alignment: Alignment.bottomCenter,
+          child: Material(
+            color: backgroundColor ?? Theme.of(ctx).colorScheme.surface,
+            borderRadius: const BorderRadius.vertical(top: Radius.circular(12)),
+            clipBehavior: Clip.antiAlias,
+            child: SizedBox(
+              width: mq.size.width,
+              height: maxH,
               child: Column(
-                mainAxisSize: MainAxisSize.min,
                 children: [
                   if (showDragHandle)
                     Padding(
@@ -81,7 +83,7 @@ Future<T?> showFadeModalBottomSheet<T>({
                         ),
                       ),
                     ),
-                  Flexible(child: builder(ctx)),
+                  Expanded(child: builder(ctx)),
                 ],
               ),
             ),

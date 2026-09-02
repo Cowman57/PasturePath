@@ -16,6 +16,7 @@ import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../../app_theme.dart';
 import '../../models/paddock.dart';
+import '../../models/paddock_work_list.dart';
 import '../../models/job.dart';
 import '../../models/gps_fix.dart';
 import '../../models/load_session.dart';
@@ -23,6 +24,7 @@ import '../../services/backup_store.dart';
 import '../../services/job_store.dart';
 import '../../services/last_load_prefs.dart';
 import '../../services/load_session_store.dart';
+import '../../services/paddock_work_list_store.dart';
 import '../../services/map_tile_cache.dart';
 import '../../services/weather_service.dart';
 import '../../models/job_weather.dart';
@@ -36,8 +38,13 @@ import '../../models/tool_setup_dimensions.dart';
 import '../../services/tool_preset_store.dart';
 import '../../widgets/animated_popup.dart';
 import '../../widgets/navigation_arrow_icon.dart';
+import '../../widgets/work_list_sheet.dart';
 import 'tool_setup_tab.dart';
 
+import 'package:wakelock_plus/wakelock_plus.dart';
+import 'package:http/http.dart' as http;
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:url_launcher/url_launcher.dart';
 /// Paddock editor sub-state while [_MapScreenState._editorMode] is true.
 enum EditorTool { browse, drawOuter, drawHole, edit }
 
@@ -125,9 +132,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   double? _suggestedTargetSpeedKph;
   /// Optional scale reading on the job-complete panel.
   TextEditingController? _completedReadingCtrl;
+  /// Planned paddocks + rate for the current run.
+  PaddockWorkList _workList = PaddockWorkList();
+  /// Tap paddocks to add/remove them from [_workList].
+  bool _workListPicking = false;
 
   // selection
   final Set<int> _selectedIdx = <int>{};
+  /// Paddocks the current job started in. Stays fixed until the job ends.
+  final Set<int> _jobLockedPaddockIdx = <int>{};
   bool _suppressAutoPaddockSelect = false;
   int? _lastGpsInsidePaddockIdx;
   int _lastAutoSelectMs = 0;
@@ -135,6 +148,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   // nav
   bool _navMode = false;
+  static const _pipChannel = MethodChannel('pasturepath/pip');
+  bool _inPipMode = false;
   LatLng? _pointA;
   LatLng? _pointB;
   /// Parallel guidance lines — each entry is one swath line (may be clipped to segments).
@@ -257,7 +272,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _editingIdx = null;
       _clearVertexSelection();
       _selectedIdx.clear();
+      _jobLockedPaddockIdx.clear();
       _navMode = false;
+      _workListPicking = false;
       _followGps = false;
       if (_showingHistory) {
         _showingHistory = false;
@@ -405,6 +422,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _editingIdx = null;
       _clearVertexSelection();
     });
+    _workList.removeNames(names);
+    await _persistWorkList();
     await _persistFarmJson(_buildFarmGeoJsonBytes());
     if (_paddocks.isEmpty) {
       final p = await SharedPreferences.getInstance();
@@ -677,6 +696,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   @override
   void initState() {
     super.initState();
+    _gpsInput.addListener(_onGpsInputChanged);
+
+    _pipChannel.setMethodCallHandler((call) async {
+      if (call.method == 'pipModeChanged') {
+        final args = call.arguments as Map;
+        final inPip = args['inPip'] as bool;
+        if (mounted) setState(() => _inPipMode = inPip);
+      }
+    });
     // Smooth pulsing animation for chevrons
     _chevCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
       ..repeat();
@@ -685,8 +713,22 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     _gpsSmoothTicker = createTicker(_onGpsSmoothTick);
 
-    WidgetsBinding.instance.addPostFrameCallback((_) async {
+    WidgetsBinding.instance.addPostFrameCallback((_) => _runStartupInit());
+  }
+
+  int _startupSizeRetries = 0;
+
+  Future<void> _runStartupInit() async {
+    if (!mounted) return;
+    final size = MediaQuery.sizeOf(context);
+    if ((size.width < 1 || size.height < 1) && _startupSizeRetries < 40) {
+      _startupSizeRetries++;
+      WidgetsBinding.instance.addPostFrameCallback((_) => _runStartupInit());
+      return;
+    }
+    try {
       await _loadPrefs();
+      if (!mounted) return;
       _toolPresets = await ToolPresetStore.list();
       if (_selectedToolPresetName != null) {
         final ok = _toolPresets.any(
@@ -700,8 +742,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
       await _loadPersistedFarmJsonIfAny();
       await _refreshLoadSessionState();
+      await _loadWorkList();
+      if (!mounted) return;
       await _ensureLocationFlow();
-    });
+    } catch (e, st) {
+      debugPrint('Startup init failed: $e\n$st');
+    }
   }
 
   @override
@@ -726,6 +772,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _completedReadingCtrl?.dispose();
     _chevCtrl.dispose();
     _drawerTabCtrl.dispose();
+    _inPipMode = false;
+    _gpsInput.removeListener(_onGpsInputChanged);
+    WakelockPlus.disable();
+    _setPipEnabled(false);
     super.dispose();
   }
 
@@ -752,6 +802,33 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           (presetName != null && presetName.isNotEmpty) ? presetName : null;
     });
     await _gpsInput.setMode(gpsMode);
+  }
+
+  Future<void> _loadWorkList() async {
+    try {
+      final list = await PaddockWorkListStore.load();
+      if (!mounted) return;
+      if (_paddocks.isNotEmpty) {
+        list.pruneMissing(_paddocks.map((p) => p.name));
+      }
+      setState(() => _workList = list);
+      _rebuildPaddockLayers();
+    } catch (e) {
+      debugPrint('Work list load failed: $e');
+    }
+  }
+
+  Future<void> _persistWorkList() async {
+    await PaddockWorkListStore.save(_workList);
+  }
+
+  void _pruneWorkListToFarm() {
+    if (_workList.isEmpty || _paddocks.isEmpty) return;
+    final before = _workList.paddockCount;
+    _workList.pruneMissing(_paddocks.map((p) => p.name));
+    if (_workList.paddockCount != before) {
+      _persistWorkList();
+    }
   }
 
   Future<void> _writePrefsToDisk() async {
@@ -915,6 +992,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _historySwathPolys.clear();
       _historyPathPolylines.clear();
       _selectedIdx.clear();
+      _jobLockedPaddockIdx.clear();
       _navLinesNotifier.value = [];
       _guidanceParallelLines = [];
       _pointA = null;
@@ -950,6 +1028,235 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     } else {
       await _showOpenLoadDialog(open);
     }
+  }
+
+  List<String> _selectedPaddockNames() => _selectedIdx
+      .where((i) => i >= 0 && i < _paddocks.length)
+      .map((i) => _paddocks[i].name)
+      .toList();
+
+  void _beginWorkListPicking() {
+    setState(() {
+      _workListPicking = true;
+      _suppressAutoPaddockSelect = true;
+      _workList.addNames(_selectedPaddockNames());
+    });
+    _persistWorkList();
+    _rebuildPaddockLayers();
+  }
+
+  void _endWorkListPicking({bool openSheet = false}) {
+    setState(() => _workListPicking = false);
+    if (openSheet && _workList.isNotEmpty) {
+      _showWorkListDialog();
+    }
+  }
+
+  void _toggleWorkListPaddockAt(int idx) {
+    if (idx < 0 || idx >= _paddocks.length) return;
+    final name = _paddocks[idx].name;
+    setState(() {
+      if (_workList.contains(name)) {
+        _workList.removeName(name);
+      } else {
+        _workList.addNames([name]);
+      }
+      _selectedIdx
+        ..clear()
+        ..add(idx);
+      _suppressAutoPaddockSelect = true;
+    });
+    _persistWorkList();
+    _rebuildPaddockLayers();
+  }
+
+  Future<void> _onAddListPressed() async {
+    if (_workListPicking) {
+      _endWorkListPicking(openSheet: _workList.targetRatePerHa == null);
+      return;
+    }
+    _beginWorkListPicking();
+  }
+
+  Future<void> _markWorkListJobsComplete(Iterable<String> jobPaddockNames) async {
+    if (_workList.isEmpty) return;
+    final before = _workList.completedCount;
+    setState(() => _workList.markCompleted(jobPaddockNames));
+    if (_workList.completedCount == before) return;
+    await _persistWorkList();
+    _rebuildPaddockLayers();
+  }
+
+  Future<void> _clearWorkList({bool confirm = true}) async {
+    if (_workList.isEmpty) return;
+    if (confirm) {
+      final ok = await showFadeDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Delete paddock list?'),
+          content: const Text(
+            'Removes the planned paddocks and progress. This does not delete jobs.',
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Keep list'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Delete list'),
+            ),
+          ],
+        ),
+      );
+      if (ok != true || !mounted) return;
+    }
+    setState(() {
+      _workList.clear();
+      _workListPicking = false;
+    });
+    await _persistWorkList();
+    _rebuildPaddockLayers();
+  }
+
+  Future<void> _showWorkListDialog() async {
+    if (!mounted) return;
+    final last = await LastLoadPrefs.load();
+    if (!mounted) return;
+    final result = await showWorkListSheet(
+      context: context,
+      list: _workList,
+      paddocks: _paddocks,
+      areaText: _areaText,
+      hintProductName: last?.productName,
+      hintRate: last?.primaryRatePerHa.toStringAsFixed(0),
+      hintUnit: last?.unit,
+      onRemovePaddock: (name) {
+        _workList.removeName(name);
+        _rebuildPaddockLayers();
+        _persistWorkList();
+      },
+    );
+    if (!mounted) return;
+    if (result == null) {
+      await _persistWorkList();
+      if (mounted) setState(() {});
+      return;
+    }
+    if (result.delete) {
+      await _clearWorkList();
+      return;
+    }
+    _workList.unit = result.unit;
+    _workList.productName = result.productName?.trim().isEmpty == true
+        ? null
+        : result.productName?.trim();
+    if (result.rate != null && result.rate! > 0) {
+      _workList.targetRatePerHa = result.rate;
+    }
+    await _persistWorkList();
+    if (mounted) setState(() {});
+  }
+
+  Widget _workListHudChip() {
+    if (_workList.isEmpty && !_workListPicking) return const SizedBox.shrink();
+    final totalHa = _workList.totalHa(_paddocks);
+    final doneHa = _workList.completedHa(_paddocks);
+    final scheme = Theme.of(context).colorScheme;
+    final rate = _workList.targetRatePerHa;
+    return Material(
+      elevation: _fabElevation,
+      color: _fabFill,
+      borderRadius: BorderRadius.circular(14),
+      clipBehavior: Clip.antiAlias,
+      child: InkWell(
+        onTap: _showWorkListDialog,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                '${_compactArea(doneHa)}/${_compactArea(totalHa)} ${_units == 'feet' ? 'ac' : 'ha'}'
+                '  ${_workList.completedCount}/${_workList.paddockCount} paddocks',
+                style: TextStyle(
+                  fontWeight: FontWeight.w800,
+                  fontSize: 13,
+                  color: scheme.primary,
+                ),
+              ),
+              if (rate != null && rate > 0)
+                Text(
+                  '${_workList.displayName}  ${rate.toStringAsFixed(0)} ${_workList.rateUnitLabel}',
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w600,
+                    color: scheme.onSurface.withOpacity(0.75),
+                  ),
+                ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  String _compactArea(double ha) {
+    final v = _units == 'feet' ? ha * 2.47105 : ha;
+    if ((v - v.roundToDouble()).abs() < 0.05) return v.round().toString();
+    return v.toStringAsFixed(1);
+  }
+
+  Widget _workListPickingBar() {
+    final scheme = Theme.of(context).colorScheme;
+    final n = _workList.paddockCount;
+    return Material(
+      elevation: _fabElevation,
+      color: _fabFill,
+      borderRadius: BorderRadius.circular(16),
+      clipBehavior: Clip.antiAlias,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(14, 10, 8, 10),
+        child: Row(
+          children: [
+            Icon(Icons.touch_app, color: scheme.primary),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Text(
+                    'Tap paddocks to add or remove',
+                    style: TextStyle(
+                      fontWeight: FontWeight.w700,
+                      fontSize: 13,
+                      color: scheme.onSurface,
+                    ),
+                  ),
+                  Text(
+                    '$n paddock${n == 1 ? '' : 's'} · ${_areaText(_workList.totalHa(_paddocks))}',
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      color: scheme.primary,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            TextButton(
+              onPressed: () => _endWorkListPicking(
+                openSheet: _workList.isNotEmpty &&
+                    _workList.targetRatePerHa == null,
+              ),
+              child: const Text('Done'),
+            ),
+          ],
+        ),
+      ),
+    );
   }
 
   Future<void> _showStartLoadDialog() async {
@@ -1201,10 +1508,16 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       builder: (ctx) {
         return AlertDialog(
           title: Text(open.displayName),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx),
+              child: const Text('Not now'),
+            ),
+          ],
           content: SingleChildScrollView(
             child: Column(
               mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 Text(
                   'Start ${open.currentQty.toStringAsFixed(0)} ${open.unitLabel}'
@@ -1225,30 +1538,29 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   onSubmitted: (_) => Navigator.pop(ctx, 'record'),
                   decoration: InputDecoration(
                     labelText: 'Scale reading (${open.unitLabel})',
-                    hintText: 'Becomes new start after Record',
+                    hintText: 'Current hopper / tank weight',
                   ),
+                ),
+                const SizedBox(height: 16),
+                FilledButton.icon(
+                  onPressed: () => Navigator.pop(ctx, 'record'),
+                  icon: const Icon(Icons.scale),
+                  label: const Text('Save reading'),
+                ),
+                const SizedBox(height: 8),
+                FilledButton.tonalIcon(
+                  onPressed: () => Navigator.pop(ctx, 'end'),
+                  icon: const Icon(Icons.check_circle_outline),
+                  label: const Text('Save reading & end load'),
+                ),
+                const SizedBox(height: 4),
+                TextButton(
+                  onPressed: () => Navigator.pop(ctx, 'cancel_load'),
+                  child: const Text('End load using expected remaining'),
                 ),
               ],
             ),
           ),
-          actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, 'cancel_load'),
-              child: const Text('Finish expected'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(ctx),
-              child: const Text('Close'),
-            ),
-            TextButton(
-              onPressed: () => Navigator.pop(ctx, 'record'),
-              child: const Text('Record'),
-            ),
-            ElevatedButton(
-              onPressed: () => Navigator.pop(ctx, 'end'),
-              child: const Text('End load'),
-            ),
-          ],
         );
       },
     );
@@ -1257,7 +1569,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       final confirm = await showFadeDialog<bool>(
         context: context,
         builder: (ctx) => AlertDialog(
-          title: const Text('Finish with expected?'),
+          title: const Text('End load using expected remaining?'),
           content: Text(
             'Uses expected remaining '
             '(${open.expectedQtyNow.toStringAsFixed(0)} ${open.unitLabel}) '
@@ -1266,11 +1578,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(ctx, false),
-              child: const Text('Keep open'),
+              child: const Text('Keep load open'),
             ),
             ElevatedButton(
               onPressed: () => Navigator.pop(ctx, true),
-              child: const Text('Finish'),
+              child: const Text('End load'),
             ),
           ],
         ),
@@ -1358,10 +1670,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
     }
     if (latest == null) return;
-    final actual = session.productRateForJob(latest.jobId) ??
-        session.rateForJob(latest.jobId);
+    // Gate speed from actual application intensity (used / covered swath),
+    // not the paddock-area rate used for records.
+    final used = session.productAmountForJob(latest.jobId) ??
+        session.amountForJob(latest.jobId);
+    if (used == null || used <= 0 || latest.appliedHa <= 0) return;
+    final actual = used / latest.appliedHa;
     final target = session.primaryTargetRatePerHa;
-    if (actual == null || actual <= 0 || target <= 0) return;
+    if (actual <= 0 || target <= 0) return;
 
     final avgSpeed = _completedJobSummary?.avgSpeedKph ??
         _navLiveAvgSpeedKph();
@@ -1445,6 +1761,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _persistedJsonPath = path;
         _maybeAutoSelectPaddockFromGps();
       });
+      _pruneWorkListToFarm();
       _rebuildPaddockLayers();
       if (_paddocks.isNotEmpty && _mapReady) {
         _mapController.move(_paddocks.first.labelPoint, 16);
@@ -1461,7 +1778,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _maybeDismissCompletedSummaryOnGpsLeave();
       // Pose updates go through notifiers — do not setState the whole map screen.
     });
-    await _gpsInput.start();
+    try {
+      await _gpsInput.start();
+    } catch (e) {
+      debugPrint('GPS start failed: $e');
+    }
     if (mounted && _gpsInput.lastError != null) {
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(content: Text(_gpsInput.lastError!)),
@@ -1540,6 +1861,22 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _dispHeadingNotifier.value = _tractorHeadingDeg();
   }
 
+
+  void _onGpsInputChanged() {
+    _updateWakeLock();
+  }
+
+  void _updateWakeLock() {
+    if (_navMode || _gpsInput.isUsbActive) {
+      WakelockPlus.enable();
+    } else {
+      WakelockPlus.disable();
+    }
+  }
+
+  void _setPipEnabled(bool enabled) {
+    _pipChannel.invokeMethod('setPipEnabled', {'enabled': enabled});
+  }
   void _onGpsSmoothTick(Duration elapsed) {
     if (!mounted || _gpsSmoothness <= 0) return;
 
@@ -1838,11 +2175,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final expect = load?.expectedQtyNow;
     final loadLabel = load == null
         ? 'Load'
-        : (expect == null
-            ? 'Load'
-            : expect >= 1000
-                ? '${(expect / 1000).toStringAsFixed(1)}k'
-                : expect.toStringAsFixed(0));
+        : [
+            'Load',
+            expect == null
+                ? 'open'
+                : expect >= 1000
+                    ? '${(expect / 1000).toStringAsFixed(1)}k ${load.unitLabel}'
+                    : '${expect.toStringAsFixed(0)} ${load.unitLabel}',
+          ].join('\n');
     return Column(
       mainAxisSize: MainAxisSize.min,
       crossAxisAlignment: CrossAxisAlignment.center,
@@ -1865,6 +2205,12 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _jobRailChip(
           icon: Icons.square_foot,
           label: areaLabel,
+        ),
+        const SizedBox(height: _fabGap),
+        _jobRailChip(
+          icon: _workListPicking ? Icons.done : Icons.playlist_add,
+          label: _workListPicking ? 'Done' : 'Add list',
+          onTap: _onAddListPressed,
         ),
         const SizedBox(height: _fabGap),
         _jobRailChip(
@@ -1903,8 +2249,18 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       ? '${(ha * 2.47105).toStringAsFixed(1)} ac'
       : '${ha.toStringAsFixed(1)} ha';
 
-  double _navSelectedTotalHa() =>
-      _selectedIdx.fold(0.0, (s, i) => s + _paddocks[i].areaHa);
+  double _navSelectedTotalHa() {
+    final idxs = _jobAreaPaddockIndices();
+    return idxs.fold(0.0, (s, i) {
+      if (i < 0 || i >= _paddocks.length) return s;
+      return s + _paddocks[i].areaHa;
+    });
+  }
+
+  Iterable<int> _jobAreaPaddockIndices() {
+    if (_jobLockedPaddockIdx.isNotEmpty) return _jobLockedPaddockIdx;
+    return _selectedIdx;
+  }
 
   /// Applied metres for coverage — same basis as job finish / summary:
   /// paddock-gated length of the simplified boom path (not raw GPS weave).
@@ -1928,14 +2284,32 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   double _paddockGatedPathDistanceM(List<LatLng> path) {
     if (path.length < 2) return 0;
-    if (_selectedIdx.isEmpty) return pathDistanceMeters(path);
+    if (_jobAreaPaddockIndices().isEmpty) return pathDistanceMeters(path);
     double total = 0;
     for (var i = 1; i < path.length; i++) {
       final a = path[i - 1];
       final b = path[i];
-      if (_inSelectedPaddock(a) && _inSelectedPaddock(b)) {
+      
+      // Check if segment should be counted
+      final aInside = _inSelectedPaddock(a);
+      final bInside = _inSelectedPaddock(b);
+      
+      if (aInside && bInside) {
+        // Both endpoints inside: count full segment
         total += const Distance().as(LengthUnit.Meter, a, b);
+      } else if (aInside || bInside) {
+        // One endpoint inside: check midpoint
+        final mid = LatLng(
+          (a.latitude + b.latitude) / 2,
+          (a.longitude + b.longitude) / 2,
+        );
+        if (_inSelectedPaddock(mid)) {
+          // Midpoint is inside: count full segment (approximation)
+          total += const Distance().as(LengthUnit.Meter, a, b);
+        }
+        // If midpoint is outside, segment is mostly outside - skip it
       }
+      // Both endpoints outside: skip segment
     }
     return total;
   }
@@ -2143,8 +2517,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                         setState(() {
                           _selectedIdx.clear();
                           _editorSelecting = false;
-                        });
-                        _rebuildPaddockLayers();
+    });
+    _updateWakeLock();
+    _setPipEnabled(false);
+    _rebuildPaddockLayers();
                       } else {
                         _editorSelectAll();
                       }
@@ -2511,8 +2887,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   bool _inSelectedPaddock(LatLng p) {
-    if (_selectedIdx.isEmpty) return true;
-    for (final i in _selectedIdx) {
+    final idxs = _jobAreaPaddockIndices();
+    if (idxs.isEmpty) return true;
+    for (final i in idxs) {
+      if (i < 0 || i >= _paddocks.length) continue;
       final pd = _paddocks[i];
       if (pointInPolygon(p, pd.outer, pd.holes)) return true;
     }
@@ -2524,22 +2902,49 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (!mounted) return;
     final polys = <Polygon>[];
     final labels = <Marker>[];
-    final zoom = _mapReady ? _mapController.camera.zoom : 0.0;
+    var zoom = 0.0;
+    if (_mapReady) {
+      try {
+        zoom = _mapController.camera.zoom;
+      } catch (_) {
+        zoom = 0.0;
+      }
+    }
     final showLabels = zoom >= 15.0;
     _paddockLabelsZoomVisible = showLabels;
 
     for (int i = 0; i < _paddocks.length; i++) {
       final pd = _paddocks[i];
       final isSel = _selectedIdx.contains(i);
+      final inList = _workList.contains(pd.name);
+      final listDone = inList && _workList.completedNames.contains(pd.name);
+      Color border;
+      var borderW = 2.0;
+      var extraFill = 0.0;
+      if (isSel) {
+        border = Colors.yellow.shade700;
+        borderW = 3.5;
+        extraFill = 0.08;
+      } else if (listDone) {
+        border = Colors.teal.shade700;
+        borderW = 3.0;
+        extraFill = 0.10;
+      } else if (inList) {
+        border = Colors.orange.shade800;
+        borderW = 3.0;
+        extraFill = 0.10;
+      } else {
+        border = _overlayColor;
+      }
       polys.add(
         Polygon(
           points: pd.outer,
           holePointsList: pd.holes,
           color: _overlayColor.withOpacity(
-            (_overlayOpacity + (isSel ? 0.08 : 0.0)).clamp(0.0, 1.0),
+            (_overlayOpacity + extraFill).clamp(0.0, 1.0),
           ),
-          borderColor: isSel ? Colors.yellow.shade700 : _overlayColor,
-          borderStrokeWidth: isSel ? 3.5 : 2.0,
+          borderColor: border,
+          borderStrokeWidth: borderW,
           isFilled: true,
         ),
       );
@@ -2616,6 +3021,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     if (_completedJobSummary != null) {
       setState(_dismissCompletedJobSummary);
+      return true;
+    }
+
+    if (_workListPicking) {
+      _endWorkListPicking();
       return true;
     }
 
@@ -3081,7 +3491,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     List<List<LatLng>> clipJob(LatLng aa, LatLng bb) {
       final out = <List<LatLng>>[];
-      if (_selectedIdx.isEmpty) {
+      final jobIdx = _jobAreaPaddockIndices();
+      if (jobIdx.isEmpty) {
         final vb = _mapController.camera.visibleBounds;
         const samples = 360;
         var seg = <LatLng>[];
@@ -3098,7 +3509,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         if (seg.length >= 2) out.add(seg);
         return out;
       }
-      for (final i in _selectedIdx) {
+      for (final i in jobIdx) {
+        if (i < 0 || i >= _paddocks.length) continue;
         final pd = _paddocks[i];
         out.addAll(clipLineABToPolygonExact(aa, bb, pd.outer, pd.holes));
       }
@@ -3110,12 +3522,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     double maxSpan;
     double alongExtentM;
-    if (_selectedIdx.isEmpty) {
+    final jobIdx = _jobAreaPaddockIndices();
+    if (jobIdx.isEmpty) {
       maxSpan = _approxSpanMeters(_mapController.camera.visibleBounds);
       alongExtentM = maxSpan * 2;
     } else {
       final rings = <List<LatLng>>[];
-      for (final i in _selectedIdx) {
+      for (final i in jobIdx) {
+        if (i < 0 || i >= _paddocks.length) continue;
         rings.add(_paddocks[i].outer);
       }
       final perpExtent = guidancePerpendicularExtentM(
@@ -3257,6 +3671,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     setState(() {
       _paddocks = parsed.paddocks;
       _selectedIdx.clear();
+      _jobLockedPaddockIdx.clear();
       _suppressAutoPaddockSelect = false;
       _navMode = false;
       _navLinesNotifier.value = [];
@@ -3267,6 +3682,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _clearSwathDisplay();
       _maybeAutoSelectPaddockFromGps();
     });
+    _pruneWorkListToFarm();
     _rebuildPaddockLayers();
 
     if (_paddocks.isNotEmpty && _mapReady) {
@@ -3350,6 +3766,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
 
     final hit = _hitTestPaddock(p);
+    if (_navMode) return;
+    if (_workListPicking) {
+      if (hit != null) _toggleWorkListPaddockAt(hit);
+      return;
+    }
     if (hit != null) {
       setState(() {
         _suppressAutoPaddockSelect = false;
@@ -3435,7 +3856,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   void _maybeAutoSelectPaddockFromGps() {
-    if (_showingHistory || _editorMode) return;
+    if (_showingHistory || _editorMode || _navMode || _workListPicking) return;
     final pos = _dispPos ?? _currentPos;
     if (pos == null || _paddocks.isEmpty) return;
 
@@ -3667,6 +4088,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (_selectedIdx.isEmpty) return;
     setState(() {
       _navMode = true;
+      _workListPicking = false;
+      _jobLockedPaddockIdx
+        ..clear()
+        ..addAll(_selectedIdx);
       _editorMode = false;
       _tool = EditorTool.browse;
       _tempOuter.clear();
@@ -3709,6 +4134,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _rotationMode = RotationMode.travelUp;
       _followGps = true;
     });
+    _updateWakeLock();
+    _setPipEnabled(true);
+    _rebuildPaddockLayers();
 
     if (_mapReady && _dispPos != null) {
       final hdg = _tractorHeadingDeg();
@@ -3737,6 +4165,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (!_navMode || _jobStartTime == null || _jobPath.length < 2) {
       setState(() {
         _navMode = false;
+        _jobLockedPaddockIdx.clear();
         _pointA = null;
         _pointB = null;
         _navLinesNotifier.value = [];
@@ -3776,8 +4205,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       final durHrs = end.difference(_jobStartTime!).inMilliseconds / 3600000.0;
       final avgKph = durHrs > 0 ? (_speedDistanceM / 1000.0) / durHrs : 0.0;
 
-      final names = _selectedIdx.map((i) => _paddocks[i].name).toList()..sort();
-      final totalHa = _selectedIdx.fold(0.0, (s, i) => s + _paddocks[i].areaHa);
+      final jobIdx = _jobAreaPaddockIndices()
+          .where((i) => i >= 0 && i < _paddocks.length)
+          .toList();
+      final names = jobIdx.map((i) => _paddocks[i].name).toList()..sort();
+      final totalHa = jobIdx.fold(0.0, (s, i) => s + _paddocks[i].areaHa);
 
       final n = await JobStore.nextSequenceForDay(end);
       final id = JobStore.dayTitle(end, n);
@@ -3789,8 +4221,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       if (weatherLoc == null && savedPath.isNotEmpty) {
         weatherLoc = savedPath[savedPath.length ~/ 2];
       }
-      if (weatherLoc == null && _selectedIdx.isNotEmpty) {
-        weatherLoc = _paddocks[_selectedIdx.first].labelPoint;
+      if (weatherLoc == null && jobIdx.isNotEmpty) {
+        weatherLoc = _paddocks[jobIdx.first].labelPoint;
       }
       JobWeather? weather;
       if (weatherLoc != null) {
@@ -3819,14 +4251,20 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       await JobStore.save(job);
 
       final appliedHa = job.areaAppliedHaFor(widthM);
-      await LoadSessionStore.attachJob(jobId: job.id, appliedHa: appliedHa);
+      await LoadSessionStore.attachJob(
+        jobId: job.id,
+        appliedHa: appliedHa,
+        paddockHa: job.totalHa,
+      );
       await _refreshLoadSessionState();
+      await _markWorkListJobsComplete(names);
 
       if (!mounted) return;
       Navigator.of(context, rootNavigator: true).pop();
 
       setState(() {
         _navMode = false;
+        _jobLockedPaddockIdx.clear();
         _pointA = null;
         _pointB = null;
         _navLinesNotifier.value = [];
@@ -4197,6 +4635,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             );
           },
         ),
+        const Divider(),
+        const ListTile(title: Text('About', style: TextStyle(fontWeight: FontWeight.bold))),
+        _AppVersionTile(),
       ],
         );
       },
@@ -4635,6 +5076,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         ..clear()
         ..addAll(paths);
       _navMode = false;
+      _workListPicking = false;
+      _jobLockedPaddockIdx.clear();
       _selectedIdx.clear();
       _navLinesNotifier.value = [];
       _guidanceParallelLines.clear();
@@ -4798,7 +5241,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                       const SizedBox(width: 8),
                       ElevatedButton(
                         onPressed: _saveCompletedJobReading,
-                        child: const Text('Save'),
+                        child: const Text('Save reading'),
                       ),
                     ],
                   ),
@@ -4908,7 +5351,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 : 0.0;
 
             // Product totals keyed by name + record unit.
-            final productTotals = <String, ({double amount, double appliedHa, String unit, String? name})>{};
+            final productTotals = <String, ({double amount, String unit, String? name})>{};
             for (final j in tallyRows) {
               final stats = productStats[j.id];
               if (stats == null) continue;
@@ -4918,18 +5361,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   '${stats.displayName}|${stats.recordUnitLabel}';
               final prev = productTotals[key];
               final amt = stats.amount * share;
-              final ha = appliedFor(j);
               if (prev == null) {
                 productTotals[key] = (
                   amount: amt,
-                  appliedHa: ha,
                   unit: stats.recordUnitLabel,
                   name: stats.productName,
                 );
               } else {
                 productTotals[key] = (
                   amount: prev.amount + amt,
-                  appliedHa: prev.appliedHa + ha,
                   unit: prev.unit,
                   name: prev.name,
                 );
@@ -5096,8 +5536,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                           if (productTotals.isNotEmpty) ...[
                             const SizedBox(height: 6),
                             ...productTotals.values.map((p) {
-                              final rate = p.appliedHa > 0
-                                  ? p.amount / p.appliedHa
+                              final rate = paddockAreaHa > 0
+                                  ? p.amount / paddockAreaHa
                                   : 0.0;
                               final label = (p.name != null &&
                                       p.name!.trim().isNotEmpty)
@@ -5229,6 +5669,25 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
+    if (_navMode && _inPipMode) {
+      return Material(
+        type: MaterialType.transparency,
+        color: Colors.black,
+        child: Center(
+          child: ValueListenableBuilder<double>(
+            valueListenable: _signedErrorNotifier,
+            builder: (context, signedErrorM, _) => _ErrorChevronHud(
+              signedErrorM: signedErrorM,
+              chevronsPerSide: 2,
+              controller: _chevCtrl,
+              rowWidthMeters: _toMeters(_width <= 0 ? 3.0 : _width),
+              pipMode: true,
+            ),
+          ),
+        ),
+      );
+    }
+
     final safe = MediaQuery.of(context).padding;
     final startCenter = _dispPos ?? _currentPos ?? const LatLng(-37.6710, 175.6860);
 
@@ -5380,6 +5839,19 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                     } else {
                       _editorBeginSelect(hit);
                     }
+                  }
+                  return;
+                }
+                if (!_navMode && !_showingHistory) {
+                  final hit = _hitTestPaddock(latlng);
+                  if (hit != null) {
+                    if (!_workListPicking) {
+                      setState(() {
+                        _workListPicking = true;
+                        _suppressAutoPaddockSelect = true;
+                      });
+                    }
+                    _toggleWorkListPaddockAt(hit);
                   }
                 }
               },
@@ -5703,6 +6175,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               ),
           ],
 
+          if ((_workList.isNotEmpty || _workListPicking) &&
+              !_navMode &&
+              !_editorMode &&
+              !_showingHistory &&
+              _completedJobSummary == null)
+            Positioned(
+              left: _fabEdge,
+              top: _navMode ? navTopInset + 4 : safe.top + _fabEdge,
+              child: _workListHudChip(),
+            ),
+
           // Rotation toggle
           Positioned(
             right: _fabEdge,
@@ -5769,7 +6252,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               !_editorMode &&
               !_showingHistory &&
               _selectedIdx.isNotEmpty &&
-              _completedJobSummary == null) ...[
+              _completedJobSummary == null &&
+              !_workListPicking) ...[
             Positioned(
               left: _fabEdge,
               bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
@@ -5792,6 +6276,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               ),
             ),
           ],
+
+          if (_workListPicking &&
+              !_navMode &&
+              !_editorMode &&
+              !_showingHistory)
+            Positioned(
+              left: _fabEdge,
+              right: _fabEdge,
+              bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
+              child: _workListPickingBar(),
+            ),
 
           // Completed job summary (top — keeps bottom controls clear)
           Positioned(
@@ -6301,12 +6796,14 @@ class _ErrorChevronHud extends StatelessWidget {
   final int chevronsPerSide;
   final AnimationController controller;
   final double rowWidthMeters;
+  final bool pipMode;
 
   const _ErrorChevronHud({
     required this.signedErrorM,
     required this.chevronsPerSide,
     required this.controller,
     required this.rowWidthMeters,
+    this.pipMode = false,
   });
 
   Color _gradColorFromCenter(int idxFromCenter, int total) {
@@ -6558,6 +7055,157 @@ class _CacheMapDialogState extends State<_CacheMapDialog> {
           ),
         ],
       ),
+    );
+  }
+}
+
+class _AppVersionTile extends StatefulWidget {
+  @override
+  State<_AppVersionTile> createState() => _AppVersionTileState();
+}
+
+class _AppVersionTileState extends State<_AppVersionTile> {
+  String? _latestVersion;
+  bool _loading = true;
+  String? _error;
+  static const _repoUrl = 'https://github.com/Cowman57/PasturePath';
+  static const _releasesUrl = '$_repoUrl/releases';
+  static const _apiUrl = '$_repoUrl/releases/latest';
+
+  @override
+  void initState() {
+    super.initState();
+    _checkUpdate();
+  }
+
+  Future<void> _checkUpdate() async {
+    try {
+      final uri = Uri.parse(_apiUrl);
+      final resp = await http.get(uri, headers: {'Accept': 'application/json'});
+      if (resp.statusCode != 200) {
+        if (mounted) setState(() { _loading = false; _error = 'Check failed (${resp.statusCode})'; });
+        return;
+      }
+      final data = json.decode(resp.body) as Map;
+      final tag = data['tag_name'] as String?;
+      if (tag == null || tag.isEmpty) {
+        if (mounted) setState(() { _loading = false; _error = 'No version tag'; });
+        return;
+      }
+      if (mounted) setState(() { _latestVersion = tag; _loading = false; });
+    } catch (e) {
+      if (mounted) setState(() { _loading = false; _error = e.toString(); });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return FutureBuilder<PackageInfo>(
+      future: PackageInfo.fromPlatform(),
+      builder: (context, snap) {
+        final version = snap.data?.version ?? '—';
+        final buildNumber = snap.data?.buildNumber ?? '—';
+        final currentVersion = 'v$version+$buildNumber';
+        final currentTag = 'v$version';
+
+        String subtitle = currentVersion; // Default
+        Widget? trailing;
+        Color? titleColor;
+        IconData? icon = Icons.info;
+
+        if (_loading) {
+          subtitle = 'Checking for updates…';
+          icon = Icons.refresh;
+        } else if (_error != null) {
+          subtitle = 'Error: $_error';
+          icon = Icons.error_outline;
+          trailing = IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _checkUpdate,
+            tooltip: 'Retry',
+          );
+        } else if (_latestVersion != null && _latestVersion!.isNotEmpty) {
+          final latest = _latestVersion!.trim();
+          final current = currentTag.trim();
+          // Compare ignoring 'v' prefix
+          final latestClean = latest.startsWith('v') ? latest.substring(1) : latest;
+          final currentClean = current.startsWith('v') ? current.substring(1) : current;
+          
+          if (latestClean != currentClean) {
+            subtitle = '$currentVersion → $latest available';
+            icon = Icons.new_releases;
+            titleColor = Theme.of(context).colorScheme.primary;
+            trailing = ElevatedButton(
+              onPressed: () => launchUrl(Uri.parse(_releasesUrl), mode: LaunchMode.externalApplication),
+              child: const Text('Update'),
+            );
+          } else {
+            subtitle = '$currentVersion (up to date)';
+            icon = Icons.check_circle;
+            trailing = IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: _checkUpdate,
+              tooltip: 'Check for updates',
+            );
+          }
+        } else {
+          // _latestVersion is null or empty
+          subtitle = '$currentVersion';
+          icon = Icons.check_circle;
+          trailing = IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _checkUpdate,
+            tooltip: 'Check for updates',
+          );
+        }
+
+        return GestureDetector(
+          onTap: _loading ? null : _checkUpdate,
+          child: Container(
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
+            child: Row(
+              children: [
+                Padding(
+                  padding: const EdgeInsets.only(right: 16),
+                  child: Icon(icon, color: titleColor, size: 24),
+                ),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'PasturePath',
+                        style: TextStyle(
+                          fontWeight: FontWeight.normal,
+                          fontSize: 16,
+                          color: titleColor,
+                        ),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                      ),
+                      const SizedBox(height: 2),
+                      Text(
+                        subtitle,
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.grey.shade700,
+                        ),
+                        maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
+                      ),
+                    ],
+                  ),
+                ),
+                if (trailing != null)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 12),
+                    child: trailing,
+                  ),
+              ],
+            ),
+          ),
+        );
+      },
     );
   }
 }
