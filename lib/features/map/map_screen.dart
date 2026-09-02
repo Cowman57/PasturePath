@@ -2289,9 +2289,27 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     for (var i = 1; i < path.length; i++) {
       final a = path[i - 1];
       final b = path[i];
-      if (_inSelectedPaddock(a) && _inSelectedPaddock(b)) {
+      
+      // Check if segment should be counted
+      final aInside = _inSelectedPaddock(a);
+      final bInside = _inSelectedPaddock(b);
+      
+      if (aInside && bInside) {
+        // Both endpoints inside: count full segment
         total += const Distance().as(LengthUnit.Meter, a, b);
+      } else if (aInside || bInside) {
+        // One endpoint inside: check midpoint
+        final mid = LatLng(
+          (a.latitude + b.latitude) / 2,
+          (a.longitude + b.longitude) / 2,
+        );
+        if (_inSelectedPaddock(mid)) {
+          // Midpoint is inside: count full segment (approximation)
+          total += const Distance().as(LengthUnit.Meter, a, b);
+        }
+        // If midpoint is outside, segment is mostly outside - skip it
       }
+      // Both endpoints outside: skip segment
     }
     return total;
   }

@@ -117,12 +117,12 @@ double _distMeters(LatLng a, LatLng b) {
   return math.sqrt(dE * dE + dN * dN);
 }
 
-/// Total path length in meters.
+/// Total path length in meters (geodesic).
 double pathDistanceMeters(List<LatLng> path) {
   if (path.length < 2) return 0;
   double total = 0;
   for (int i = 1; i < path.length; i++) {
-    total += _distMeters(path[i - 1], path[i]);
+    total += const Distance().as(LengthUnit.Meter, path[i - 1], path[i]);
   }
   return total;
 }
