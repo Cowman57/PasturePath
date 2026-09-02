@@ -1,7 +1,7 @@
 name: tractorgps
 description: PasturePath V4
 publish_to: "none"
-version: 4.1.0+2
+version: 4.1.1+1
 
 environment:
   sdk: ">=3.9.0 <4.0.0"
