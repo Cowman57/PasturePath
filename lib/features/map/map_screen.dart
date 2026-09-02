@@ -7120,18 +7120,53 @@ class _AppVersionTileState extends State<_AppVersionTile> {
           );
         }
 
-        return ListTile(
-          leading: Icon(icon, color: titleColor),
-          title: Text(
-            'PasturePath',
-            style: TextStyle(
-              fontWeight: FontWeight.bold,
-              color: titleColor,
+        return GestureDetector(
+          onTap: _loading ? null : _checkUpdate,
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.1),
+            ),
+            child: Row(
+              children: [
+                if (icon != null)
+                  Padding(
+                    padding: const EdgeInsets.only(right: 16),
+                    child: Icon(icon, color: titleColor, size: 28),
+                  ),
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'PasturePath',
+                        style: TextStyle(
+                          fontWeight: FontWeight.bold,
+                          fontSize: 16,
+                          color: titleColor,
+                        ),
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        subtitle,
+                        style: TextStyle(
+                          fontSize: 14,
+                          color: Colors.grey.shade700,
+                        ),
+                        maxLines: 2,
+                      ),
+                    ],
+                  ),
+                ),
+                if (trailing != null)
+                  Padding(
+                    padding: const EdgeInsets.only(left: 16),
+                    child: trailing,
+                  ),
+              ],
             ),
           ),
-          subtitle: Text(subtitle),
-          trailing: trailing,
-          onTap: _loading ? null : _checkUpdate,
         );
       },
     );
