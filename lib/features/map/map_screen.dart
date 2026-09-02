@@ -7070,6 +7070,10 @@ class _AppVersionTileState extends State<_AppVersionTile> {
       }
       final data = json.decode(resp.body) as Map;
       final tag = data['tag_name'] as String?;
+      if (tag == null || tag.isEmpty) {
+        if (mounted) setState(() { _loading = false; _error = 'No version tag'; });
+        return;
+      }
       if (mounted) setState(() { _latestVersion = tag; _loading = false; });
     } catch (e) {
       if (mounted) setState(() { _loading = false; _error = e.toString(); });
@@ -7086,32 +7090,49 @@ class _AppVersionTileState extends State<_AppVersionTile> {
         final currentVersion = 'v$version+$buildNumber';
         final currentTag = 'v$version';
 
-        String subtitle;
+        String subtitle = currentVersion; // Default
         Widget? trailing;
         Color? titleColor;
-        IconData? icon;
+        IconData? icon = Icons.info;
 
         if (_loading) {
           subtitle = 'Checking for updates…';
           icon = Icons.refresh;
         } else if (_error != null) {
-          subtitle = 'Failed to check: $_error';
+          subtitle = 'Error: $_error';
           icon = Icons.error_outline;
           trailing = IconButton(
             icon: const Icon(Icons.refresh),
             onPressed: _checkUpdate,
             tooltip: 'Retry',
           );
-        } else if (_latestVersion != null && _latestVersion != currentTag) {
-          subtitle = '$currentVersion → $_latestVersion available';
-          icon = Icons.new_releases;
-          titleColor = Theme.of(context).colorScheme.primary;
-          trailing = ElevatedButton(
-            onPressed: () => launchUrl(Uri.parse(_releasesUrl), mode: LaunchMode.externalApplication),
-            child: const Text('Download Update'),
-          );
+        } else if (_latestVersion != null && _latestVersion!.isNotEmpty) {
+          final latest = _latestVersion!.trim();
+          final current = currentTag.trim();
+          // Compare ignoring 'v' prefix
+          final latestClean = latest.startsWith('v') ? latest.substring(1) : latest;
+          final currentClean = current.startsWith('v') ? current.substring(1) : current;
+          
+          if (latestClean != currentClean) {
+            subtitle = '$currentVersion → $latest available';
+            icon = Icons.new_releases;
+            titleColor = Theme.of(context).colorScheme.primary;
+            trailing = ElevatedButton(
+              onPressed: () => launchUrl(Uri.parse(_releasesUrl), mode: LaunchMode.externalApplication),
+              child: const Text('Update'),
+            );
+          } else {
+            subtitle = '$currentVersion (up to date)';
+            icon = Icons.check_circle;
+            trailing = IconButton(
+              icon: const Icon(Icons.refresh),
+              onPressed: _checkUpdate,
+              tooltip: 'Check for updates',
+            );
+          }
         } else {
-          subtitle = '$currentVersion (up to date)';
+          // _latestVersion is null or empty
+          subtitle = '$currentVersion';
           icon = Icons.check_circle;
           trailing = IconButton(
             icon: const Icon(Icons.refresh),
@@ -7123,18 +7144,13 @@ class _AppVersionTileState extends State<_AppVersionTile> {
         return GestureDetector(
           onTap: _loading ? null : _checkUpdate,
           child: Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            decoration: BoxDecoration(
-              borderRadius: BorderRadius.circular(8),
-              color: Theme.of(context).colorScheme.surfaceVariant.withOpacity(0.1),
-            ),
+            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
             child: Row(
               children: [
-                if (icon != null)
-                  Padding(
-                    padding: const EdgeInsets.only(right: 16),
-                    child: Icon(icon, color: titleColor, size: 28),
-                  ),
+                Padding(
+                  padding: const EdgeInsets.only(right: 16),
+                  child: Icon(icon, color: titleColor, size: 24),
+                ),
                 Expanded(
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
@@ -7142,12 +7158,14 @@ class _AppVersionTileState extends State<_AppVersionTile> {
                       Text(
                         'PasturePath',
                         style: TextStyle(
-                          fontWeight: FontWeight.bold,
+                          fontWeight: FontWeight.normal,
                           fontSize: 16,
                           color: titleColor,
                         ),
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
                       ),
-                      const SizedBox(height: 4),
+                      const SizedBox(height: 2),
                       Text(
                         subtitle,
                         style: TextStyle(
@@ -7155,13 +7173,14 @@ class _AppVersionTileState extends State<_AppVersionTile> {
                           color: Colors.grey.shade700,
                         ),
                         maxLines: 2,
+                        overflow: TextOverflow.ellipsis,
                       ),
                     ],
                   ),
                 ),
                 if (trailing != null)
                   Padding(
-                    padding: const EdgeInsets.only(left: 16),
+                    padding: const EdgeInsets.only(left: 12),
                     child: trailing,
                   ),
               ],
