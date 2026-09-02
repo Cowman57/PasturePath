@@ -18,6 +18,28 @@ class JobStore {
   static Future<String> jobsDir() => _dir('jobs');
   static Future<String> exportsDir() => _dir('exports');
 
+  // Get possible job directory paths (current + old debug if applicable)
+  static Future<List<String>> _possibleJobDirs() async {
+    final current = await jobsDir();
+    final dirs = [current];
+    
+    // Check if current path contains '.debug'
+    if (current.contains('.debug')) {
+      // Current is debug, also check release location
+      final releasePath = current.replaceFirst('.debug', '');
+      dirs.add(releasePath);
+    } else {
+      // Current is release, also check debug location
+      final debugPath = current.replaceFirst(
+        '/data/user/0/com.example.tractorgps_v3_0_5/',
+        '/data/user/0/com.example.tractorgps_v3_0_5.debug/'
+      );
+      dirs.add(debugPath);
+    }
+    
+    return dirs;
+  }
+
   static Future<List<String>> listJobFiles() async {
     final root = await jobsDir();
     final items = await io.Directory(root).list(followLinks: false).toList();
@@ -78,10 +100,32 @@ class JobStore {
   }
 
   static Future<List<JobFileSummary>> listJobSummaries() async {
-    final dir = await jobsDir();
-    final maps = await listJobSummariesIsolate(dir);
+    final possibleDirs = await _possibleJobDirs();
+    final allMaps = <Map<String, dynamic>>[];
+    
+    for (final dir in possibleDirs) {
+      try {
+        final maps = await listJobSummariesIsolate(dir);
+        allMaps.addAll(maps);
+      } catch (e) {
+        // Directory might not exist, skip it
+      }
+    }
+    
+    // Remove duplicates (same job might exist in both locations)
+    final uniqueMaps = <Map<String, dynamic>>[];
+    final seenIds = <String>{};
+    
+    for (final m in allMaps) {
+      final id = m['id'] as String?;
+      if (id != null && !seenIds.contains(id)) {
+        seenIds.add(id);
+        uniqueMaps.add(m);
+      }
+    }
+    
     return [
-      for (final m in maps)
+      for (final m in uniqueMaps)
         JobFileSummary.fromJson(
           m['filePath'] as String,
           Map<String, dynamic>.from(m)..remove('filePath'),
