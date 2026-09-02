@@ -7050,7 +7050,7 @@ class _AppVersionTileState extends State<_AppVersionTile> {
   String? _latestVersion;
   bool _loading = true;
   String? _error;
-  static const _repoUrl = 'https://github.com/anomalyco/PasturePath';
+  static const _repoUrl = 'https://github.com/Cowman57/PasturePath';
   static const _releasesUrl = '$_repoUrl/releases';
   static const _apiUrl = '$_repoUrl/releases/latest';
 
@@ -7088,25 +7088,50 @@ class _AppVersionTileState extends State<_AppVersionTile> {
 
         String subtitle;
         Widget? trailing;
+        Color? titleColor;
+        IconData? icon;
 
         if (_loading) {
           subtitle = 'Checking for updates…';
+          icon = Icons.refresh;
         } else if (_error != null) {
-          subtitle = currentVersion;
+          subtitle = 'Failed to check: $_error';
+          icon = Icons.error_outline;
+          trailing = IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _checkUpdate,
+            tooltip: 'Retry',
+          );
         } else if (_latestVersion != null && _latestVersion != currentTag) {
           subtitle = '$currentVersion → $_latestVersion available';
-          trailing = TextButton(
+          icon = Icons.new_releases;
+          titleColor = Theme.of(context).colorScheme.primary;
+          trailing = ElevatedButton(
             onPressed: () => launchUrl(Uri.parse(_releasesUrl), mode: LaunchMode.externalApplication),
-            child: const Text('Update'),
+            child: const Text('Download Update'),
           );
         } else {
           subtitle = '$currentVersion (up to date)';
+          icon = Icons.check_circle;
+          trailing = IconButton(
+            icon: const Icon(Icons.refresh),
+            onPressed: _checkUpdate,
+            tooltip: 'Check for updates',
+          );
         }
 
         return ListTile(
-          title: const Text('PasturePath'),
+          leading: Icon(icon, color: titleColor),
+          title: Text(
+            'PasturePath',
+            style: TextStyle(
+              fontWeight: FontWeight.bold,
+              color: titleColor,
+            ),
+          ),
           subtitle: Text(subtitle),
           trailing: trailing,
+          onTap: _loading ? null : _checkUpdate,
         );
       },
     );
