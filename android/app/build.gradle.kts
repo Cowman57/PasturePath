@@ -32,7 +32,8 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
+            // Note: Removing .debug suffix to share job storage with release builds
+            // applicationIdSuffix = ".debug"
             resValue("string", "app_name", "PasturePath (Debug)")
         }
         release {
