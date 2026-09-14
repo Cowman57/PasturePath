@@ -96,6 +96,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   List<ToolPreset> _toolPresets = [];
   String? _selectedToolPresetName;
   bool _satellite = false;
+  bool _accurateCalculations = true;
   TileProvider? _mapTileProvider;
 
   static const Color _overlayColor = Colors.green;
@@ -192,6 +193,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   double _coverageDistanceCacheM = 0.0;
   int _coverageDistanceCacheMs = 0;
   int _coverageDistanceCachePathLen = -1;
+  
+  /// Cached accurate area calculation (grid-based).
+  double _accurateAreaCacheHa = 0.0;
+  int _accurateAreaCacheMs = 0;
+  int _accurateAreaCachePathLen = -1;
+  double _accurateAreaCacheWidthM = -1.0;
+  
   final List<Polygon> _committedSwathPolys = [];
   final ValueNotifier<List<Polygon>> _swathCommittedNotifier = ValueNotifier([]);
   final ValueNotifier<Polygon?> _swathLiveNotifier = ValueNotifier(null);
@@ -779,7 +787,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     super.dispose();
   }
 
-  // ---------- Prefs ----------
+  // ---------  
   Future<void> _loadPrefs() async {
     final p = await SharedPreferences.getInstance();
     final gpsMode = GpsInputModeX.fromPrefs(p.getString('gpsInputMode'));
@@ -792,6 +800,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         hitchToAxle: p.getDouble('hitchToAxle') ?? p.getDouble('drawbarLength') ?? 3.0,
       );
       _satellite = p.getBool('satellite') ?? false;
+      _accurateCalculations = p.getBool('accurateCalculations') ?? true;
       _gpsSmoothness = p.getDouble('gpsSmoothness') ?? 0.0;
       _gpsSmoother.smoothness = _gpsSmoothness;
       if (_gpsSmoothness > 0) {
@@ -841,6 +850,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     await p.setDouble('hitchToAxle', _toolDims.hitchToAxle);
     await p.setDouble('drawbarLength', _toolDims.hitchToAxle);
     await p.setBool('satellite', _satellite);
+    await p.setBool('accurateCalculations', _accurateCalculations);
     await p.setString(ThemeController.prefsKey, ThemeController.toPrefs(widget.themeController.mode));
     await p.setDouble('gpsSmoothness', _gpsSmoothness);
     await p.setString('gpsInputMode', _gpsInput.mode.prefsValue);
@@ -860,6 +870,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     'hitchToAxle': _toolDims.hitchToAxle,
     'drawbarLength': _toolDims.hitchToAxle,
     'satellite': _satellite,
+    'accurateCalculations': _accurateCalculations,
     ThemeController.prefsKey: ThemeController.toPrefs(widget.themeController.mode),
     'gpsSmoothness': _gpsSmoothness,
     'gpsInputMode': _gpsInput.mode.prefsValue,
@@ -2317,10 +2328,44 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   double _navLiveAppliedAreaHa() =>
       _coverageAppliedDistanceM() * _currentSwathWidthM() / 10000.0;
 
+  /// More accurate live area calculation using grid-based method.
+  /// More reliable but computationally more expensive.
+  double _navLiveAppliedAreaHaAccurate() {
+    if (_jobPath.length < 2) return 0;
+    
+    final pathLen = _jobPath.length;
+    final width = _currentSwathWidthM();
+    final now = DateTime.now().millisecondsSinceEpoch;
+    
+    // Check cache: valid for 1000ms (1 second) and if path length and width haven't changed
+    if (pathLen == _accurateAreaCachePathLen &&
+        (width - _accurateAreaCacheWidthM).abs() < 0.01 &&
+        now - _accurateAreaCacheMs < 1000) {
+      return _accurateAreaCacheHa;
+    }
+    
+    final area = areaAppliedHaGridAccurate(_jobPath, width);
+    
+    // Update cache
+    _accurateAreaCacheHa = area;
+    _accurateAreaCachePathLen = pathLen;
+    _accurateAreaCacheWidthM = width;
+    _accurateAreaCacheMs = now;
+    
+    return area;
+  }
+
   double _navLiveCoveragePercent() {
     final total = _navSelectedTotalHa();
     if (total <= 0) return 0;
     return (_navLiveAppliedAreaHa() / total * 100).clamp(0, double.infinity);
+  }
+
+  /// More accurate live coverage calculation using grid-based method.
+  double _navLiveCoveragePercentAccurate() {
+    final total = _navSelectedTotalHa();
+    if (total <= 0) return 0;
+    return (_navLiveAppliedAreaHaAccurate() / total * 100).clamp(0, double.infinity);
   }
 
   double _navLiveAvgSpeedKph() {
@@ -2368,8 +2413,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               )
             else
               stat('Avg', '${_navLiveAvgSpeedKph().toStringAsFixed(1)} km/h'),
-            stat('Covered', _areaText(_navLiveAppliedAreaHa())),
-            stat('Coverage', '${_navLiveCoveragePercent().toStringAsFixed(0)}%'),
+            stat('Covered', _areaText(_accurateCalculations ? _navLiveAppliedAreaHaAccurate() : _navLiveAppliedAreaHa())),
+            stat('Coverage', '${(_accurateCalculations ? _navLiveCoveragePercentAccurate() : _navLiveCoveragePercent()).toStringAsFixed(0)}%'),
           ],
         ),
       ),
@@ -4114,9 +4159,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _gpsRecordPath.add(_currentPos!);
         _rebuildJobPathFromGps();
       }
-      _coverageDistanceCacheM = 0.0;
+_coverageDistanceCacheM = 0.0;
       _coverageDistanceCachePathLen = -1;
       _coverageDistanceCacheMs = 0;
+      _accurateAreaCacheHa = 0.0;
+      _accurateAreaCachePathLen = -1;
+      _accurateAreaCacheWidthM = -1.0;
+      _accurateAreaCacheMs = 0;
       _currentSpeedKph = 0.0;
       _suggestedTargetSpeedKph = null;
       _lastSwathRecordBucket = null;
@@ -4507,6 +4556,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           value: _satellite,
           onChanged: (v) {
             setState(() => _satellite = v);
+            _savePrefs();
+          },
+        ),
+        SwitchListTile(
+          title: const Text('Accurate area calculations'),
+          subtitle: const Text('Use grid-based overlap detection for live coverage'),
+          value: _accurateCalculations,
+          onChanged: (v) {
+            setState(() => _accurateCalculations = v);
             _savePrefs();
           },
         ),

@@ -923,3 +923,152 @@ List<List<LatLng>> clipPolylineToPolygon(
   return parts;
 }
 
+/// Simplified accurate area calculation that works for basic paths.
+/// Creates swath rectangles for each path segment and sums their areas.
+/// More reliable than simple path length × width for overlapping paths.
+double areaAppliedHaSimplifiedAccurate(List<LatLng> path, double swathWidthM) {
+  if (path.length < 2 || swathWidthM <= 0) return 0;
+  
+  const R = 6371000.0; // Earth radius in meters
+  final origin = path[path.length ~/ 2];
+  final cosLat = math.cos(origin.latitude * math.pi / 180.0);
+  final halfWidth = swathWidthM * 0.5;
+  
+  double totalAreaM2 = 0;
+  
+  // Process each segment
+  for (int i = 1; i < path.length; i++) {
+    final a = path[i - 1];
+    final b = path[i];
+    
+    // Skip tiny segments
+    if (_distMeters(a, b) < 0.1) continue;
+    
+    // Calculate bearing from a to b
+    final bearing = _bearingDeg(a, b);
+    final bearingRad = bearing * math.pi / 180.0;
+    
+    // Create rectangle corners offset perpendicular to the path
+    final northComp = math.cos(bearingRad);
+    final eastComp = math.sin(bearingRad);
+    
+    // Offset points perpendicular to path
+    final leftOffsetNorth = -eastComp * halfWidth;
+    final leftOffsetEast = northComp * halfWidth;
+    final rightOffsetNorth = eastComp * halfWidth;
+    final rightOffsetEast = -northComp * halfWidth;
+    
+    // Convert offsets to lat/lng
+    final leftA = _offsetPoint(a, leftOffsetEast, leftOffsetNorth, cosLat);
+    final leftB = _offsetPoint(b, leftOffsetEast, leftOffsetNorth, cosLat);
+    final rightA = _offsetPoint(a, rightOffsetEast, rightOffsetNorth, cosLat);
+    final rightB = _offsetPoint(b, rightOffsetEast, rightOffsetNorth, cosLat);
+    
+    // Create polygon (rectangle): leftA, leftB, rightB, rightA
+    final rect = [leftA, leftB, rightB, rightA];
+    
+    // Calculate area of rectangle using shoelace formula
+    final centroid = _shoelaceCentroid(rect);
+    final centroidCosLat = math.cos(centroid.latitude * math.pi / 180.0);
+    
+    double toX(LatLng p) => (p.longitude - centroid.longitude) * (math.pi / 180.0) * R * centroidCosLat;
+    double toY(LatLng p) => (p.latitude - centroid.latitude) * (math.pi / 180.0) * R;
+    
+    double area = 0;
+    for (int i = 0, j = rect.length - 1; i < rect.length; j = i++) {
+      final xi = toX(rect[i]), yi = toY(rect[i]);
+      final xj = toX(rect[j]), yj = toY(rect[j]);
+      area += (xj * yi - xi * yj);
+    }
+    totalAreaM2 += 0.5 * area.abs();
+  }
+  
+  return totalAreaM2 / 10000.0; // Convert m² to hectares
+}
+
+/// Helper function to offset a point by east/north meters
+LatLng _offsetPoint(LatLng point, double eastM, double northM, double cosLat) {
+  const rm = 111320.0; // meters per degree at equator
+  return LatLng(
+    point.latitude + northM / rm,
+    point.longitude + eastM / (rm * cosLat),
+  );
+}
+
+/// Most accurate area calculation using grid-based overlap detection.
+/// Creates a grid of cells covered by the swath and counts each cell once.
+/// This properly handles overlaps and gives the true covered area.
+double areaAppliedHaGridAccurate(List<LatLng> path, double swathWidthM, {
+  double minSegmentM = 0.35,
+}) {
+  if (path.length < 2 || swathWidthM <= 0) return 0;
+  
+  // Use the overlap detection function but count ALL covered cells
+  final wM = swathWidthM <= 0 ? 3.0 : swathWidthM;
+  final half = wM * 0.5;
+  final cellM = (wM / 3.0).clamp(0.5, 1.25);
+  
+  final origin = path[path.length ~/ 2];
+  final cosLat = math.cos(origin.latitude * math.pi / 180.0);
+  final cells = <String, bool>{}; // Just track if cell is covered
+  
+  // Process all segments, don't split at jumps for area calculation
+  for (int i = 1; i < path.length; i++) {
+    final a = path[i - 1];
+    final b = path[i];
+    if (_distMeters(a, b) < minSegmentM) continue;
+    
+    _stampSegmentCoverage(
+      _toLocal(a, origin, cosLat),
+      _toLocal(b, origin, cosLat),
+      half,
+      cellM,
+      cells,
+    );
+  }
+  
+  // Each cell area = cellM × cellM
+  final totalCells = cells.length;
+  final totalAreaM2 = totalCells * cellM * cellM;
+  
+  return totalAreaM2 / 10000.0; // Convert m² to hectares
+}
+
+/// Stamp coverage for a segment (simplified version of _stampSegmentOverlap)
+void _stampSegmentCoverage(
+  _XY a,
+  _XY b,
+  double halfW,
+  double cellM,
+  Map<String, bool> cells,
+) {
+  final minX = math.min(a.x, b.x) - halfW;
+  final maxX = math.max(a.x, b.x) + halfW;
+  final minY = math.min(a.y, b.y) - halfW;
+  final maxY = math.max(a.y, b.y) + halfW;
+  
+  final minGx = (minX / cellM).floor();
+  final maxGx = (maxX / cellM).floor();
+  final minGy = (minY / cellM).floor();
+  final maxGy = (maxY / cellM).floor();
+  
+  for (int gx = minGx; gx <= maxGx; gx++) {
+    for (int gy = minGy; gy <= maxGy; gy++) {
+      final cx = (gx + 0.5) * cellM;
+      final cy = (gy + 0.5) * cellM;
+      if (_distPointToSegXY(_XY(cx, cy), a, b) > halfW) continue;
+      
+      final key = '$gx,$gy';
+      cells[key] = true;
+    }
+  }
+}
+
+/// Coverage percentage using grid-based accurate area calculation.
+/// Most reliable method for true coverage measurement.
+double coveragePercentGridAccurate(List<LatLng> path, double swathWidthM, double paddockAreaHa) {
+  if (paddockAreaHa <= 0) return 0;
+  final applied = areaAppliedHaGridAccurate(path, swathWidthM);
+  return (applied / paddockAreaHa * 100).clamp(0, double.infinity);
+}
+

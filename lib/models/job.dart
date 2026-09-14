@@ -208,9 +208,21 @@ class SavedJob {
   double areaAppliedHaFor(double fallbackSwathWidthM) =>
       effectiveAppliedDistanceM * resolveSwathWidthM(fallbackSwathWidthM) / 10000.0;
 
+  /// Most accurate area calculation using grid-based overlap detection.
+  /// Properly handles overlaps and gives true covered area.
+  double areaAppliedHaAccurateFor(double fallbackSwathWidthM) =>
+      areaAppliedHaGridAccurate(path, resolveSwathWidthM(fallbackSwathWidthM));
+
   double coveragePercentFor(double fallbackSwathWidthM) {
     if (totalHa <= 0) return 0;
     return (areaAppliedHaFor(fallbackSwathWidthM) / totalHa * 100).clamp(0, double.infinity);
+  }
+
+  /// Most accurate coverage calculation using grid-based area.
+  /// Most reliable method for true coverage measurement.
+  double coveragePercentAccurateFor(double fallbackSwathWidthM) {
+    if (totalHa <= 0) return 0;
+    return (areaAppliedHaAccurateFor(fallbackSwathWidthM) / totalHa * 100).clamp(0, double.infinity);
   }
 
   Map<String, dynamic> toJson() => {
