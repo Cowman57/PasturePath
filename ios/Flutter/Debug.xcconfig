@@ -1,1 +1,7 @@
 #include "Generated.xcconfig"
+
+// Add .debug suffix to bundle identifier for debug builds
+PRODUCT_BUNDLE_IDENTIFIER = com.example.tractorgpsV305.debug
+
+// Set display name for debug build
+CFBundleDisplayName = PasturePath V4 (Debug)

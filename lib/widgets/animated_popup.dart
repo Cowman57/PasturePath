@@ -78,7 +78,7 @@ Future<T?> showFadeModalBottomSheet<T>({
                           color: Theme.of(ctx)
                               .colorScheme
                               .onSurfaceVariant
-                              .withOpacity(0.4),
+                              .withValues(alpha: 0.4),
                           borderRadius: BorderRadius.circular(2),
                         ),
                       ),

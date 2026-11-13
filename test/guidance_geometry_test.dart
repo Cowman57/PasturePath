@@ -18,10 +18,10 @@ void main() {
     const origin = LatLng(-37.0, 175.0);
     // ~100 m east-west span at this latitude (roughly 0.001 deg lon)
     final ring = [
-      LatLng(-37.0000, 175.0000),
-      LatLng(-37.0000, 175.0010),
-      LatLng(-37.0005, 175.0010),
-      LatLng(-37.0005, 175.0000),
+      const LatLng(-37.0000, 175.0000),
+      const LatLng(-37.0000, 175.0010),
+      const LatLng(-37.0005, 175.0010),
+      const LatLng(-37.0005, 175.0000),
     ];
     // AB north-south: normal points east
     final extent = guidancePerpendicularExtentM(

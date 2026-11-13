@@ -59,8 +59,11 @@ void main() {
       'id': 'Legacy Job',
       'startedAt': DateTime(2026, 2, 1, 9).toIso8601String(),
       'endedAt': DateTime(2026, 2, 1, 10).toIso8601String(),
+      // ~2.53 m spacing => ~250 m of real travel, matching pathDistanceM so
+      // sanitizeAppliedPathDistanceM keeps the stored value.
       'path': [
-        for (int i = 0; i < 100; i++) {'lat': -37.0 + i * 0.00001, 'lng': 175.0},
+        for (int i = 0; i < 100; i++)
+          {'lat': -37.0 + i * 0.00002269, 'lng': 175.0},
       ],
       'paddockNames': ['South'],
       'totalHa': 8.0,
@@ -105,9 +108,11 @@ void main() {
       'id': '03/08/26 Job 1',
       'startedAt': DateTime(2026, 8, 3, 9).toIso8601String(),
       'endedAt': DateTime(2026, 8, 3, 10).toIso8601String(),
+      // ~2.6 m spacing => well over 480 m of real travel, so the stored
+      // pathDistanceM survives sanitizeAppliedPathDistanceM().
       'path': [
         for (int i = 0; i < 200; i++)
-          {'lat': -37.0 + i * 0.00001, 'lng': 175.0},
+          {'lat': -37.0 + i * 0.0000235, 'lng': 175.0},
       ],
       'paddockNames': ['West'],
       'totalHa': 12.0,

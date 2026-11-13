@@ -30,20 +30,20 @@ class GeoJsonParser {
         final coords = (geom['coordinates'] as List?) ?? const [];
         if (coords.isEmpty) continue;
 
-        List<LatLng> _toRing(List ring) {
+        List<LatLng> toRing(List ring) {
           return ring.map<LatLng>((c) {
             final lon = (c as List)[0] * 1.0;
-            final lat = (c as List)[1] * 1.0;
+            final lat = (c)[1] * 1.0;
             return LatLng(lat, lon);
           }).toList();
         }
 
-        final outer = _toRing(coords.first as List);
+        final outer = toRing(coords.first as List);
         // drop duplicate last point if closed
         if (outer.length >= 2 && outer.first == outer.last) { outer.removeLast(); }
         final holes = <List<LatLng>>[];
         for (int i = 1; i < coords.length; i++) {
-          final h = _toRing(coords[i] as List);
+          final h = toRing(coords[i] as List);
           if (h.length >= 2 && h.first == h.last) { h.removeLast(); }
           holes.add(h);
         }

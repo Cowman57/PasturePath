@@ -1,1 +1,4 @@
 #include "Generated.xcconfig"
+
+// Ensure release build uses the standard bundle identifier (no suffix)
+PRODUCT_BUNDLE_IDENTIFIER = com.example.tractorgpsV305

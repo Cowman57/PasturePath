@@ -190,7 +190,7 @@ class JobStore {
       final parts = baseName.split('.');
       final ext = parts.length > 1 ? '.${parts.last}' : '';
       final stem = ext.isEmpty ? baseName : baseName.substring(0, baseName.length - ext.length);
-      path = '$dir/${stem}-$k$ext';
+      path = '$dir/$stem-$k$ext';
       f = io.File(path);
       k++;
     }
@@ -260,7 +260,7 @@ class JobStore {
   }
 
   static Future<void> shareFile(String path) async {
-    await Share.shareXFiles([XFile(path)]);
+    await SharePlus.instance.share(ShareParams(files: [XFile(path)]));
   }
 
   static String _xml(String s) {

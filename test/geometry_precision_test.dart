@@ -1,6 +1,6 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:latlong2/latlong.dart';
-import '../lib/services/geometry.dart';
+import 'package:tractorgps/services/geometry.dart';
 
 void main() {
   group('Geometry precision analysis', () {
@@ -10,8 +10,8 @@ void main() {
       // So 0.001° latitude ≈ 111.32 m
       
       final path1deg = [
-        LatLng(-37.0, 175.0),
-        LatLng(-38.0, 175.0), // 1 degree south
+        const LatLng(-37.0, 175.0),
+        const LatLng(-38.0, 175.0), // 1 degree south
       ];
       
       final distance1deg = pathDistanceMeters(path1deg);
@@ -20,8 +20,8 @@ void main() {
       
       // Test small distances
       final pathSmall = [
-        LatLng(-37.0, 175.0),
-        LatLng(-37.00001, 175.0), // 0.00001° ~ 1.11 m
+        const LatLng(-37.0, 175.0),
+        const LatLng(-37.00001, 175.0), // 0.00001° ~ 1.11 m
       ];
       
       final distanceSmall = pathDistanceMeters(pathSmall);
@@ -31,12 +31,12 @@ void main() {
     test('Swath area calculation with path simplification', () {
       // Test with a wiggly path that should be simplified
       final path = [
-        LatLng(-37.0, 175.0),
-        LatLng(-37.0001, 175.0001),
-        LatLng(-37.0002, 175.0002),
-        LatLng(-37.0003, 175.0003),
-        LatLng(-37.0004, 175.0004),
-        LatLng(-37.0005, 175.0005),
+        const LatLng(-37.0, 175.0),
+        const LatLng(-37.0001, 175.0001),
+        const LatLng(-37.0002, 175.0002),
+        const LatLng(-37.0003, 175.0003),
+        const LatLng(-37.0004, 175.0004),
+        const LatLng(-37.0005, 175.0005),
       ];
       
       const swathWidthM = 20.0;
@@ -59,13 +59,13 @@ void main() {
     test('Overlap detection accuracy', () {
       // Create overlapping swaths
       final path1 = [
-        LatLng(-37.0, 175.0),
-        LatLng(-37.005, 175.0),
+        const LatLng(-37.0, 175.0),
+        const LatLng(-37.005, 175.0),
       ];
       
       final path2 = [
-        LatLng(-37.0, 175.00015), // 1.5m east of path1 (with 20m swath, should overlap)
-        LatLng(-37.005, 175.00015),
+        const LatLng(-37.0, 175.00015), // 1.5m east of path1 (with 20m swath, should overlap)
+        const LatLng(-37.005, 175.00015),
       ];
       
       const swathWidthM = 20.0;

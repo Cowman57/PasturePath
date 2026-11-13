@@ -1,6 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tractorgps/services/gps/nmea_parser.dart';
-import 'package:tractorgps/services/gps/usb_serial_gps_source.dart';
 
 void main() {
   group('UsbSerialGpsSource sentence drain', () {

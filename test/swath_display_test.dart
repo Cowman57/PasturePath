@@ -33,10 +33,10 @@ void main() {
 
   test('oriented swath ring uses bevel joins at corners', () {
     final stamps = [
-      SwathStamp(const LatLng(-37.0, 175.0), 0),
-      SwathStamp(const LatLng(-37.0005, 175.0), 0),
-      SwathStamp(const LatLng(-37.0005, 175.0005), 90),
-      SwathStamp(const LatLng(-37.001, 175.0005), 90),
+      const SwathStamp(LatLng(-37.0, 175.0), 0),
+      const SwathStamp(LatLng(-37.0005, 175.0), 0),
+      const SwathStamp(LatLng(-37.0005, 175.0005), 90),
+      const SwathStamp(LatLng(-37.001, 175.0005), 90),
     ];
     final ring = buildSwathRingFromOrientedStamps(stamps, 3.0);
     expect(ring.length, greaterThan(6));

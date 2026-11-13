@@ -105,24 +105,38 @@ double _minDistToBoundaryMeters(LatLng p, List<LatLng> outer, List<List<LatLng>>
     }
   }
   walkRing(outer);
-  for (final h in holes) walkRing(h);
+  for (final h in holes) {
+    walkRing(h);
+  }
   return best;
 }
 
 double _distMeters(LatLng a, LatLng b) {
-  const Rm = 111320.0;
+  const mPerDeg = 111320.0;
   final lat0 = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
-  final dE = (b.longitude - a.longitude) * Rm * math.cos(lat0);
-  final dN = (b.latitude - a.latitude) * Rm;
+  final dE = (b.longitude - a.longitude) * mPerDeg * math.cos(lat0);
+  final dN = (b.latitude - a.latitude) * mPerDeg;
   return math.sqrt(dE * dE + dN * dN);
 }
+
+/// Geodesic calculator without per-call rounding.
+///
+/// `Distance()` defaults to `roundResult: true`, which rounds EVERY segment to a
+/// whole metre. At real GPS spacing (~2.4 m) that silently loses ~17% of path
+/// length, which then under-reports applied area and coverage. All distance and
+/// area maths uses this unrounded instance instead.
+const Distance _geodesicDistance = Distance(roundResult: false);
+
+/// Geodesic distance between two points, in metres, without rounding.
+double distanceMetersBetween(LatLng a, LatLng b) =>
+    _geodesicDistance.as(LengthUnit.Meter, a, b);
 
 /// Total path length in meters (geodesic).
 double pathDistanceMeters(List<LatLng> path) {
   if (path.length < 2) return 0;
   double total = 0;
   for (int i = 1; i < path.length; i++) {
-    total += const Distance().as(LengthUnit.Meter, path[i - 1], path[i]);
+    total += distanceMetersBetween(path[i - 1], path[i]);
   }
   return total;
 }
@@ -163,14 +177,14 @@ double distancePointToPolylineMeters(LatLng p, List<LatLng> line) {
 }
 
 double _distPointToSegMeters(LatLng p, LatLng a, LatLng b) {
-  const Rm = 111320.0;
+  const mPerDeg = 111320.0;
   final lat0 = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
-  final ax = a.longitude * Rm * math.cos(lat0);
-  final ay = a.latitude * Rm;
-  final bx = b.longitude * Rm * math.cos(lat0);
-  final by = b.latitude * Rm;
-  final px = p.longitude * Rm * math.cos(lat0);
-  final py = p.latitude * Rm;
+  final ax = a.longitude * mPerDeg * math.cos(lat0);
+  final ay = a.latitude * mPerDeg;
+  final bx = b.longitude * mPerDeg * math.cos(lat0);
+  final by = b.latitude * mPerDeg;
+  final px = p.longitude * mPerDeg * math.cos(lat0);
+  final py = p.latitude * mPerDeg;
 
   final vx = bx - ax, vy = by - ay;
   final wx = px - ax, wy = py - ay;
@@ -185,12 +199,12 @@ double _distPointToSegMeters(LatLng p, LatLng a, LatLng b) {
 
 /// Parametric t on segment AB where it intersects CD, or null.
 double? _segmentIntersectionT(LatLng a, LatLng b, LatLng c, LatLng d) {
-  const Rm = 111320.0;
+  const mPerDeg = 111320.0;
   final lat0 = ((a.latitude + b.latitude + c.latitude + d.latitude) * 0.25) * math.pi / 180.0;
   final cosLat = math.cos(lat0);
 
-  double toX(LatLng p) => p.longitude * Rm * cosLat;
-  double toY(LatLng p) => p.latitude * Rm;
+  double toX(LatLng p) => p.longitude * mPerDeg * cosLat;
+  double toY(LatLng p) => p.latitude * mPerDeg;
 
   final ax = toX(a), ay = toY(a);
   final bx = toX(b), by = toY(b);
@@ -225,7 +239,9 @@ List<double> _collectClipTs(
     }
   }
   addRing(outer);
-  for (final h in holes) addRing(h);
+  for (final h in holes) {
+    addRing(h);
+  }
   ts.sort();
   // Deduplicate near-equal t values
   final out = <double>[];
@@ -374,8 +390,12 @@ List<LatLng> simplifySwathPath(List<LatLng> path, {double minDistM = 0.55}) {
       next.latitude - curr.latitude,
     );
     var turnDeg = (bearingOut - bearingIn) * 180.0 / math.pi;
-    while (turnDeg > 180) turnDeg -= 360;
-    while (turnDeg < -180) turnDeg += 360;
+    while (turnDeg > 180) {
+      turnDeg -= 360;
+    }
+    while (turnDeg < -180) {
+      turnDeg += 360;
+    }
 
     // Skip tight GPS back-and-forth on short hops.
     if (turnDeg.abs() > 28 && _distMeters(prev, curr) < 3.0) continue;
@@ -924,8 +944,11 @@ List<List<LatLng>> clipPolylineToPolygon(
 }
 
 /// Simplified accurate area calculation that works for basic paths.
-/// Creates swath rectangles for each path segment and sums their areas.
-/// More reliable than simple path length × width for overlapping paths.
+/// Sum of per-segment swath rectangles (shoelace), locally projected.
+///
+/// NOTE: this does NOT subtract overlap between segments — it is essentially a
+/// slightly better-projected `areaAppliedHa`. Use [areaAppliedHaGridAccurate]
+/// for true overlap-aware coverage (that is what the app ships).
 double areaAppliedHaSimplifiedAccurate(List<LatLng> path, double swathWidthM) {
   if (path.length < 2 || swathWidthM <= 0) return 0;
   
@@ -1006,11 +1029,15 @@ double areaAppliedHaGridAccurate(List<LatLng> path, double swathWidthM, {
   // Use the overlap detection function but count ALL covered cells
   final wM = swathWidthM <= 0 ? 3.0 : swathWidthM;
   final half = wM * 0.5;
-  final cellM = (wM / 3.0).clamp(0.5, 1.25);
+  // Cells across the swath. Because cross-section coverage is weighted
+  // fractionally (see _stampSegmentCoverage) a straight band is exact at any
+  // grid alignment, so this only needs to be fine enough for curves.
+  const cellsAcross = 6;
+  final cellM = wM / cellsAcross;
   
   final origin = path[path.length ~/ 2];
   final cosLat = math.cos(origin.latitude * math.pi / 180.0);
-  final cells = <String, bool>{}; // Just track if cell is covered
+  final cells = <String, double>{}; // cell -> covered fraction 0..1
   
   // Process all segments, don't split at jumps for area calculation
   for (int i = 1; i < path.length; i++) {
@@ -1027,39 +1054,50 @@ double areaAppliedHaGridAccurate(List<LatLng> path, double swathWidthM, {
     );
   }
   
-  // Each cell area = cellM × cellM
-  final totalCells = cells.length;
-  final totalAreaM2 = totalCells * cellM * cellM;
-  
+  // Sum the covered fraction of every cell (fractional, so sub-cell detail is
+  // preserved instead of being rounded to whole cells).
+  var coveredCells = 0.0;
+  for (final f in cells.values) {
+    coveredCells += f;
+  }
+  final totalAreaM2 = coveredCells * cellM * cellM;
+
   return totalAreaM2 / 10000.0; // Convert m² to hectares
 }
 
-/// Stamp coverage for a segment (simplified version of _stampSegmentOverlap)
+/// Stamp coverage for a segment, weighting each cell by the fraction covered.
+///
+/// A cell whose centre is [d] from the segment is counted as
+/// `(halfW + cellM/2 - d) / cellM` covered, clamped to 0..1. That linear ramp is
+/// exact for a straight band however the grid happens to fall, which whole-cell
+/// counting was not — that quantised the cross-section and was measured +35%
+/// (3 m swath) to -12% (6 m swath) on a plain straight run. Taking `max` per
+/// cell gives the union, so overlaps never double count.
 void _stampSegmentCoverage(
   _XY a,
   _XY b,
   double halfW,
   double cellM,
-  Map<String, bool> cells,
+  Map<String, double> cells,
 ) {
-  final minX = math.min(a.x, b.x) - halfW;
-  final maxX = math.max(a.x, b.x) + halfW;
-  final minY = math.min(a.y, b.y) - halfW;
-  final maxY = math.max(a.y, b.y) + halfW;
-  
-  final minGx = (minX / cellM).floor();
-  final maxGx = (maxX / cellM).floor();
-  final minGy = (minY / cellM).floor();
-  final maxGy = (maxY / cellM).floor();
-  
+  // Pad by a full cell so partially covered edge cells are considered too.
+  final pad = halfW + cellM;
+  final minGx = ((math.min(a.x, b.x) - pad) / cellM).floor();
+  final maxGx = ((math.max(a.x, b.x) + pad) / cellM).floor();
+  final minGy = ((math.min(a.y, b.y) - pad) / cellM).floor();
+  final maxGy = ((math.max(a.y, b.y) + pad) / cellM).floor();
+
   for (int gx = minGx; gx <= maxGx; gx++) {
     for (int gy = minGy; gy <= maxGy; gy++) {
       final cx = (gx + 0.5) * cellM;
       final cy = (gy + 0.5) * cellM;
-      if (_distPointToSegXY(_XY(cx, cy), a, b) > halfW) continue;
-      
+      final d = _distPointToSegXY(_XY(cx, cy), a, b);
+      final f = ((halfW + cellM * 0.5 - d) / cellM).clamp(0.0, 1.0);
+      if (f <= 0) continue;
+
       final key = '$gx,$gy';
-      cells[key] = true;
+      final prev = cells[key];
+      if (prev == null || f > prev) cells[key] = f;
     }
   }
 }

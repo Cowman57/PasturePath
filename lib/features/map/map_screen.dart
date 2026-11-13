@@ -2,7 +2,6 @@
 import 'dart:async';
 import 'dart:io' as io;
 import 'dart:math' as math;
-import 'dart:typed_data';
 import 'dart:convert';
 
 import 'package:file_picker/file_picker.dart';
@@ -90,6 +89,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   RotationMode _rotationMode = RotationMode.northUp;
   bool _followGps = true;
 
+  // Remembered map view (session only): the rotation + zoom the user sets on
+  // the map outside nav, restored when they come back from a job or history.
+  // Nav mode ignores these — it is always travel-up at implement-width zoom.
+  RotationMode _savedRotationMode = RotationMode.northUp;
+  double _savedZoom = 16.0;
+  double? _savedRotationDeg;
+
   // settings
   String _units = "meters";
   ToolSetupDimensions _toolDims = const ToolSetupDimensions();
@@ -149,8 +155,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   // nav
   bool _navMode = false;
-  static const _pipChannel = MethodChannel('pasturepath/pip');
-  bool _inPipMode = false;
   LatLng? _pointA;
   LatLng? _pointB;
   /// Parallel guidance lines — each entry is one swath line (may be clipped to segments).
@@ -161,12 +165,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   static const double _guidanceAlongTrackMargin = 1.5;
   static const int _navLogicIntervalMs = 200;
   static const double _cameraMoveThresholdM = 0.35;
-  static const double _cameraRotateThresholdDeg = 1.0;
   static const int _guidanceScanRadius = 3;
   int _lastNavLogicMs = 0;
   /// Desired follow aim (GPS). Separate from camera center so chase can finish.
   LatLng? _lastCameraTarget;
-  double? _lastCameraRotationDeg;
   AnimationController? _cameraSwoopCtrl;
   static const Duration _cameraSwoopDuration = Duration(milliseconds: 480);
   /// Soft chase factor per GPS smooth tick (~follow / travel-up).
@@ -644,7 +646,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   /// Index in [ring] at which to insert [p] (on the nearest edge).
   int _nearestEdgeInsertIndex(List<LatLng> ring, LatLng p) {
     if (ring.length < 2) return ring.length;
-    const dist = Distance();
+    const dist = Distance(roundResult: false);
     var bestD = double.infinity;
     var bestInsert = 1;
     for (var i = 0; i < ring.length; i++) {
@@ -669,11 +671,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (ab < 1e-3) return dist.as(LengthUnit.Meter, p, a);
     // Local ENU projection around a for a stable segment distance.
     final lat0 = a.latitude * math.pi / 180.0;
-    final mPerDegLat = 111320.0;
+    const mPerDegLat = 111320.0;
     final mPerDegLon = 111320.0 * math.cos(lat0);
     double x(LatLng q) => (q.longitude - a.longitude) * mPerDegLon;
     double y(LatLng q) => (q.latitude - a.latitude) * mPerDegLat;
-    final ax = 0.0, ay = 0.0;
+    const ax = 0.0, ay = 0.0;
     final bx = x(b), by = y(b);
     final px = x(p), py = y(p);
     final abx = bx - ax, aby = by - ay;
@@ -706,13 +708,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     super.initState();
     _gpsInput.addListener(_onGpsInputChanged);
 
-    _pipChannel.setMethodCallHandler((call) async {
-      if (call.method == 'pipModeChanged') {
-        final args = call.arguments as Map;
-        final inPip = args['inPip'] as bool;
-        if (mounted) setState(() => _inPipMode = inPip);
-      }
-    });
     // Smooth pulsing animation for chevrons
     _chevCtrl = AnimationController(vsync: this, duration: const Duration(milliseconds: 1100))
       ..repeat();
@@ -780,10 +775,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _completedReadingCtrl?.dispose();
     _chevCtrl.dispose();
     _drawerTabCtrl.dispose();
-    _inPipMode = false;
     _gpsInput.removeListener(_onGpsInputChanged);
     WakelockPlus.disable();
-    _setPipEnabled(false);
     super.dispose();
   }
 
@@ -929,7 +922,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     try {
       preview = jsonDecode(utf8.decode(bytes)) as Map<String, dynamic>;
       if (preview['format'] != 'pasturepath-backup') {
-        throw FormatException('Not a PasturePath backup');
+        throw const FormatException('Not a PasturePath backup');
       }
     } catch (e) {
       if (!mounted) return;
@@ -1017,7 +1010,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _rebuildPaddockLayers();
     await _loadPersistedFarmJsonIfAny();
     await _refreshLoadSessionState();
-    _resetToMapDefaults();
+    _restoreSavedMapView();
   }
 
   Future<void> _refreshLoadSessionState() async {
@@ -1203,7 +1196,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   style: TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.w600,
-                    color: scheme.onSurface.withOpacity(0.75),
+                    color: scheme.onSurface.withValues(alpha: 0.75),
                   ),
                 ),
             ],
@@ -1444,15 +1437,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
 
     final sameUnit = last != null && last.unit == unit;
-    final name = pickStr(nameCtrl, sameUnit ? last!.productName : null);
-    final startQty = pickNum(startCtrl, sameUnit ? last!.startQty : null);
+    final name = pickStr(nameCtrl, sameUnit ? last.productName : null);
+    final startQty = pickNum(startCtrl, sameUnit ? last.startQty : null);
     final productKg = unit == 'L'
-        ? pickNum(productKgCtrl, sameUnit ? last!.productLoadedKg : null)
+        ? pickNum(productKgCtrl, sameUnit ? last.productLoadedKg : null)
         : null;
     final dissolved = unit == 'L' && productKg != null && productKg > 0;
     final rate = pickNum(
       rateCtrl,
-      sameUnit ? last!.primaryRatePerHa : null,
+      sameUnit ? last.primaryRatePerHa : null,
     );
 
     if (startQty == null || startQty < 0 || rate == null || rate <= 0) {
@@ -1806,7 +1799,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final newPos = LatLng(p.latitude, p.longitude);
     double? newHeading = p.headingDeg ?? _currentHeadingDeg;
     if (newHeading == null && prevPos != null) {
-      final d = const Distance().as(LengthUnit.Meter, prevPos, newPos);
+      final d = distanceMetersBetween(prevPos, newPos);
       if (d >= 0.4) {
         newHeading = const Distance().bearing(prevPos, newPos);
       }
@@ -1885,9 +1878,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
   }
 
-  void _setPipEnabled(bool enabled) {
-    _pipChannel.invokeMethod('setPipEnabled', {'enabled': enabled});
-  }
   void _onGpsSmoothTick(Duration elapsed) {
     if (!mounted || _gpsSmoothness <= 0) return;
 
@@ -1906,6 +1896,21 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _maybeAutoSelectPaddockFromGps();
     _applyDisplayCamera();
     _notifyDisplayPosition();
+  }
+
+  /// Camera rotation (degrees, flutter_map convention) for the current rotation
+  /// mode, or null when the mode does not dictate one.
+  double? _targetRotationForMode({bool allowTravelFallback = false}) {
+    switch (_rotationMode) {
+      case RotationMode.northUp:
+        return 0;
+      case RotationMode.travelUp:
+        final hdg = _tractorHeadingDeg() ??
+            (allowTravelFallback ? _lastTravelBearingDeg : null);
+        return hdg != null ? -hdg : null;
+      case RotationMode.free:
+        return null;
+    }
   }
 
   void _applyDisplayCamera() {
@@ -1935,7 +1940,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       final lastAim = _lastCameraTarget;
       final threshold = _navMode ? 0.12 : _cameraMoveThresholdM;
       if (lastAim == null ||
-          const Distance().as(LengthUnit.Meter, lastAim, _dispPos!) >=
+          distanceMetersBetween(lastAim, _dispPos!) >=
               threshold) {
         _lastCameraTarget = _dispPos;
       }
@@ -1945,7 +1950,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     // First fix / large jump: swoop so startup actually reaches the marker.
     if (aimCenter != null) {
       final jumpM =
-          const Distance().as(LengthUnit.Meter, cam.center, aimCenter);
+          distanceMetersBetween(cam.center, aimCenter);
       if (jumpM >= _cameraSwoopDistanceM) {
         _swoopCamera(
           center: aimCenter,
@@ -1959,7 +1964,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     LatLng? chaseCenter;
     if (aimCenter != null) {
       final lagM =
-          const Distance().as(LengthUnit.Meter, cam.center, aimCenter);
+          distanceMetersBetween(cam.center, aimCenter);
       if (lagM >= _cameraChaseSettleM) chaseCenter = aimCenter;
     }
 
@@ -1978,7 +1983,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
     if (targetRot != null) {
       nextRot = cam.rotation + (targetRot - cam.rotation) * _cameraChaseAlpha;
-      _lastCameraRotationDeg = targetRot;
     }
     _mapController.moveAndRotate(nextCenter, cam.zoom, nextRot);
   }
@@ -2049,7 +2053,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       if (status == AnimationStatus.completed ||
           status == AnimationStatus.dismissed) {
         _lastCameraTarget = endCenter;
-        _lastCameraRotationDeg = endRot;
       }
     });
     _cameraSwoopCtrl!.forward();
@@ -2116,7 +2119,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   Color get _fabFill {
     final scheme = Theme.of(context).colorScheme;
-    return scheme.surface.withOpacity(0.94);
+    return scheme.surface.withValues(alpha: 0.94);
   }
   Color get _fabContent => Theme.of(context).colorScheme.primary;
 
@@ -2307,7 +2310,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       
       if (aInside && bInside) {
         // Both endpoints inside: count full segment
-        total += const Distance().as(LengthUnit.Meter, a, b);
+        total += distanceMetersBetween(a, b);
       } else if (aInside || bInside) {
         // One endpoint inside: check midpoint
         final mid = LatLng(
@@ -2316,7 +2319,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         );
         if (_inSelectedPaddock(mid)) {
           // Midpoint is inside: count full segment (approximation)
-          total += const Distance().as(LengthUnit.Meter, a, b);
+          total += distanceMetersBetween(a, b);
         }
         // If midpoint is outside, segment is mostly outside - skip it
       }
@@ -2400,7 +2403,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     return Material(
       elevation: 4,
-      color: Colors.black.withOpacity(0.78),
+      color: Colors.black.withValues(alpha: 0.78),
       child: Padding(
         padding: EdgeInsets.fromLTRB(10, topPad + 8, 10, 10),
         child: Row(
@@ -2512,7 +2515,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
     return Material(
       elevation: 2,
-      color: Theme.of(context).colorScheme.surface.withOpacity(0.94),
+      color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.94),
       borderRadius: BorderRadius.circular(12),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
@@ -2526,13 +2529,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                     fontWeight: FontWeight.w700,
                   ),
             ),
-            if (subtitle != null) ...[
-              const SizedBox(height: 2),
-              Text(
-                subtitle,
-                style: Theme.of(context).textTheme.bodySmall,
-              ),
-            ],
+            ...[
+            const SizedBox(height: 2),
+            Text(
+              subtitle,
+              style: Theme.of(context).textTheme.bodySmall,
+            ),
+          ],
           ],
         ),
       ),
@@ -2544,7 +2547,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         _paddocks.isNotEmpty && _selectedIdx.length == _paddocks.length;
     return Material(
       elevation: 6,
-      color: Theme.of(context).colorScheme.surface.withOpacity(0.96),
+      color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.96),
       borderRadius: BorderRadius.circular(16),
       child: Padding(
         padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
@@ -2564,7 +2567,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                           _editorSelecting = false;
     });
     _updateWakeLock();
-    _setPipEnabled(false);
     _rebuildPaddockLayers();
                       } else {
                         _editorSelectAll();
@@ -2606,7 +2608,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       final scheme = Theme.of(context).colorScheme;
       return Material(
         color: !enabled
-            ? scheme.surfaceContainerHighest.withOpacity(0.5)
+            ? scheme.surfaceContainerHighest.withValues(alpha: 0.5)
             : primary
                 ? scheme.primary
                 : scheme.surface,
@@ -2622,7 +2624,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               style: TextStyle(
                 fontWeight: FontWeight.w700,
                 color: !enabled
-                    ? scheme.onSurface.withOpacity(0.38)
+                    ? scheme.onSurface.withValues(alpha: 0.38)
                     : primary
                         ? scheme.onPrimary
                         : scheme.primary,
@@ -2634,7 +2636,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
 
     return Material(
-      color: Theme.of(context).colorScheme.surface.withOpacity(0.94),
+      color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.94),
       elevation: 4,
       borderRadius: BorderRadius.circular(14),
       child: Padding(
@@ -2751,24 +2753,24 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     return [
       Polyline(
         points: [g.gpsPos, g.hitchPivot],
-        color: Colors.blue.shade700.withOpacity(0.85),
+        color: Colors.blue.shade700.withValues(alpha: 0.85),
         strokeWidth: 2.0,
         isDotted: true,
       ),
       Polyline(
         points: [g.hitchPivot, g.trailerAxle],
-        color: Colors.orange.shade800.withOpacity(0.95),
+        color: Colors.orange.shade800.withValues(alpha: 0.95),
         strokeWidth: 3.0,
       ),
       Polyline(
         points: [g.trailerAxle, g.implementCenter],
-        color: Colors.deepOrange.shade400.withOpacity(0.95),
+        color: Colors.deepOrange.shade400.withValues(alpha: 0.95),
         strokeWidth: 2.5,
         isDotted: true,
       ),
       Polyline(
         points: [g.boomLeft, g.boomRight],
-        color: _swathColor.withOpacity(0.95),
+        color: _swathColor.withValues(alpha: 0.95),
         strokeWidth: math.max(3.0, _headingWidth),
       ),
     ];
@@ -2811,25 +2813,41 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _swoopCamera(rotationDeg: best);
     } else {
       _mapController.rotate(best);
-      _lastCameraRotationDeg = best;
     }
   }
 
-  void _resetToMapDefaults({bool moveToGps = true}) {
+  /// Restore the map view (rotation + zoom) the user had set outside nav, and
+  /// keep the camera locked on the tractor. Used when returning from a job,
+  /// from history, after loading a farm, and on first map ready.
+  void _restoreSavedMapView() {
     setState(() {
-      _rotationMode = RotationMode.northUp;
+      _rotationMode = _savedRotationMode;
       _followGps = true;
     });
-    if (_mapReady) {
-      _swoopCamera(
-        center: moveToGps ? _dispPos : null,
-        rotationDeg: 0,
-      );
-    }
+    _resetCameraThrottle();
+    if (!_mapReady) return;
+
+    // Fall back to the last travel bearing so "heading up" still resolves
+    // when the tractor is stationary and GPS course is unavailable.
+    final targetRot = _rotationMode == RotationMode.free
+        ? _savedRotationDeg
+        : _targetRotationForMode(allowTravelFallback: true);
+
+    _swoopCamera(
+      center: _dispPos,
+      zoom: _savedZoom,
+      rotationDeg: targetRot,
+    );
   }
 
   void _onMapPositionChanged(MapPosition position, bool hasGesture) {
     _maybeRefreshPaddockLayersForZoom();
+    if (hasGesture && !_navMode && !_showingHistory) {
+      // The user is setting their preferred map view — remember it so a trip
+      // through nav (or history) returns to this rotation + zoom.
+      _savedZoom = position.zoom ?? _savedZoom;
+      _savedRotationDeg = _mapController.camera.rotation;
+    }
     if (_editorMode &&
         _vertexLiveMove &&
         !_suppressVertexLiveMove &&
@@ -2857,6 +2875,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       }
     }
     if (event is MapEventRotateEnd && mounted) {
+      if (!_navMode) {
+        // Remember a hand-rotation so it survives a trip into nav.
+        _savedRotationMode = _rotationMode;
+        _savedRotationDeg = _mapController.camera.rotation;
+      }
       setState(() {});
     }
     if (event is MapEventRotateStart ||
@@ -2874,7 +2897,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   void _resetCameraThrottle() {
     _lastCameraTarget = null;
-    _lastCameraRotationDeg = null;
   }
 
   /// flutter_map: avoid move/rotate in the same frame as onMapReady.
@@ -2888,12 +2910,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (_dispPos != null && _mapReady) {
       setState(() => _followGps = true);
       _resetCameraThrottle();
-      final hdg = _rotationMode == RotationMode.travelUp
-          ? _tractorHeadingDeg()
-          : null;
       _swoopCamera(
         center: _dispPos,
-        rotationDeg: hdg != null ? -hdg : (_rotationMode == RotationMode.northUp ? 0 : null),
+        rotationDeg: _targetRotationForMode(),
       );
     }
   }
@@ -2906,6 +2925,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         case RotationMode.free: _rotationMode = RotationMode.northUp; break;
       }
     });
+    // Remember the user's choice so it can be restored after nav.
+    if (!_navMode) _savedRotationMode = _rotationMode;
     _resetCameraThrottle();
     if (_mapReady) {
       if (_rotationMode == RotationMode.northUp) _applyMapRotation(0);
@@ -2925,9 +2946,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   LatLng _offsetMeters(LatLng p, double eastM, double northM) {
-    const Rm = 111320.0;
-    final dLat = northM / Rm;
-    final dLng = eastM / (Rm * math.cos(p.latitude * math.pi / 180.0));
+    const mPerDeg = 111320.0;
+    final dLat = northM / mPerDeg;
+    final dLng = eastM / (mPerDeg * math.cos(p.latitude * math.pi / 180.0));
     return LatLng(p.latitude + dLat, p.longitude + dLng);
   }
 
@@ -2985,8 +3006,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         Polygon(
           points: pd.outer,
           holePointsList: pd.holes,
-          color: _overlayColor.withOpacity(
-            (_overlayOpacity + extraFill).clamp(0.0, 1.0),
+          color: _overlayColor.withValues(
+            alpha: (_overlayOpacity + extraFill).clamp(0.0, 1.0),
           ),
           borderColor: border,
           borderStrokeWidth: borderW,
@@ -3181,7 +3202,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final o = opacity ?? _swathOpacity;
     return buildSwathRingsFromPath(path, widthM).map((ring) => Polygon(
       points: ring,
-      color: c.withOpacity(o),
+      color: c.withValues(alpha: o),
       borderColor: Colors.transparent,
       borderStrokeWidth: 0,
       isFilled: true,
@@ -3202,7 +3223,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (ring.length < 3) return null;
     return Polygon(
       points: ring,
-      color: _swathColor.withOpacity(_swathOpacity),
+      color: _swathColor.withValues(alpha: _swathOpacity),
       borderColor: Colors.transparent,
       borderStrokeWidth: 0,
       isFilled: true,
@@ -3220,7 +3241,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (live != null && bearing != null) {
       final center = _implementGeometryAt(live, bearingDeg: bearing).implementCenter;
       if (tip.isEmpty ||
-          const Distance().as(LengthUnit.Meter, tip.last, center) >= 0.05) {
+          distanceMetersBetween(tip.last, center) >= 0.05) {
         tip.add(center);
       }
     }
@@ -3255,7 +3276,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       var advanceM = 0.0;
       final from = _swathCommittedBoomLen.clamp(1, boom.length);
       for (int i = from; i < boom.length; i++) {
-        advanceM += const Distance().as(LengthUnit.Meter, boom[i - 1], boom[i]);
+        advanceM += distanceMetersBetween(boom[i - 1], boom[i]);
       }
       final newPts = boom.length - _swathCommittedBoomLen;
       if (advanceM < _swathCommitMinAdvanceM && newPts < 4) return;
@@ -3300,7 +3321,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _navPathCommittedNotifier.value = Polyline(
       points: List<LatLng>.from(_jobPath),
       strokeWidth: 2.5,
-      color: _swathColor.withOpacity(_swathOpacity),
+      color: _swathColor.withValues(alpha: _swathOpacity),
     );
   }
 
@@ -3317,20 +3338,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
     final tip = _implementGeometryAt(live, bearingDeg: bearing).implementCenter;
     final last = _jobPath.last;
-    if (const Distance().as(LengthUnit.Meter, last, tip) < 0.01) {
+    if (distanceMetersBetween(last, tip) < 0.01) {
       if (_navPathTailNotifier.value != null) _navPathTailNotifier.value = null;
       return;
     }
     _navPathTailNotifier.value = Polyline(
       points: [last, tip],
       strokeWidth: 2.5,
-      color: _swathColor.withOpacity(_swathOpacity),
+      color: _swathColor.withValues(alpha: _swathOpacity),
     );
-  }
-
-  void _updateNavPathDisplay() {
-    _syncNavPathCommitted();
-    _syncNavPathTail();
   }
 
   void _refreshSwathPolygons() {
@@ -3361,7 +3377,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final prev = _gpsRecordPath.isNotEmpty ? _gpsRecordPath.last : null;
     var segM = 0.0;
     if (prev != null) {
-      segM = const Distance().as(LengthUnit.Meter, prev, gps);
+      segM = distanceMetersBetween(prev, gps);
       if (segM < _minGpsRecordM) return;
       if (_gpsRecordPath.length >= 2 &&
           isBackwardGpsStep(prev, _gpsRecordPath[_gpsRecordPath.length - 2], gps)) {
@@ -3410,7 +3426,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _lookAheadNotifier.value = Polyline(
       points: [_dispPos!, end],
       strokeWidth: _headingWidth.clamp(2.0, 12.0),
-      color: _headingColor.withOpacity(0.95),
+      color: _headingColor.withValues(alpha: 0.95),
       isDotted: _headingDashed,
     );
   }
@@ -3517,10 +3533,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final widthM = (_toMeters(_width) <= 0) ? 3.0 : _toMeters(_width);
     final offM = _toMeters(_offset);
 
-    const Rm = 111320.0;
+    const mPerDeg = 111320.0;
     final lat0 = ((a.latitude + b.latitude) * 0.5) * math.pi / 180.0;
-    final dE = (b.longitude - a.longitude) * Rm * math.cos(lat0);
-    final dN = (b.latitude - a.latitude) * Rm;
+    final dE = (b.longitude - a.longitude) * mPerDeg * math.cos(lat0);
+    final dN = (b.latitude - a.latitude) * mPerDeg;
     final len = math.sqrt(dE * dE + dN * dN);
     if (len == 0) return;
 
@@ -3653,7 +3669,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final center = _activeLineIndex.clamp(0, lineCount - 1);
     final lo = math.max(0, center - _guidanceScanRadius);
     final hi = math.min(lineCount - 1, center + _guidanceScanRadius);
-    for (int i = lo; i <= hi; i++) evalIndex(i);
+    for (int i = lo; i <= hi; i++) {
+      evalIndex(i);
+    }
     if (bestIdx == lo || bestIdx == hi) {
       for (int i = 0; i < lineCount; i++) {
         if (i >= lo && i <= hi) continue;
@@ -3950,7 +3968,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             points: job.path,
             strokeWidth: 2.5,
             // Distinct from filled swath so both are visibly present.
-            color: Colors.white.withOpacity(0.9),
+            color: Colors.white.withValues(alpha: 0.9),
           )
         : null;
     _navPathTailNotifier.value = null;
@@ -4184,7 +4202,6 @@ _coverageDistanceCacheM = 0.0;
       _followGps = true;
     });
     _updateWakeLock();
-    _setPipEnabled(true);
     _rebuildPaddockLayers();
 
     if (_mapReady && _dispPos != null) {
@@ -4221,7 +4238,8 @@ _coverageDistanceCacheM = 0.0;
         _guidanceParallelLines.clear();
         _lookAheadNotifier.value = null;
       });
-      _resetToMapDefaults();
+      // Leaving nav returns to the map view the user had set before.
+      _restoreSavedMapView();
       return;
     }
 
@@ -4324,7 +4342,7 @@ _coverageDistanceCacheM = 0.0;
         _showCompletedJobOnMap(job);
         _invalidateJobSummariesCache();
       });
-      _resetToMapDefaults();
+      _restoreSavedMapView();
     } catch (e) {
       if (mounted) {
         if (Navigator.of(context, rootNavigator: true).canPop()) {
@@ -4478,7 +4496,7 @@ _coverageDistanceCacheM = 0.0;
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: DropdownButtonFormField<GpsInputMode>(
-            value: _gpsInput.mode,
+            initialValue: _gpsInput.mode,
             decoration: const InputDecoration(
               labelText: 'Source',
               border: OutlineInputBorder(),
@@ -4574,7 +4592,7 @@ _coverageDistanceCacheM = 0.0;
         Padding(
           padding: const EdgeInsets.symmetric(horizontal: 16),
           child: DropdownButtonFormField<ThemeMode>(
-            value: widget.themeController.mode,
+            initialValue: widget.themeController.mode,
             decoration: const InputDecoration(
               labelText: 'Theme',
               border: OutlineInputBorder(),
@@ -4726,7 +4744,7 @@ _coverageDistanceCacheM = 0.0;
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
       decoration: BoxDecoration(
-        color: scheme.surfaceContainerHighest.withOpacity(0.55),
+        color: scheme.surfaceContainerHighest.withValues(alpha: 0.55),
         borderRadius: BorderRadius.circular(10),
       ),
       child: Column(
@@ -4861,7 +4879,7 @@ _coverageDistanceCacheM = 0.0;
                         padding: EdgeInsets.zero,
                         onPressed: _histSelected.isEmpty ? null : () async {
                           final path = await JobStore.exportGpx(_histSelected.toList());
-                          if (!mounted) return;
+                          if (!context.mounted) return;
                           ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Exported GPX: ${path.split('/').last}')));
                           await JobStore.shareFile(path);
                         },
@@ -4885,7 +4903,7 @@ _coverageDistanceCacheM = 0.0;
                           );
                           if (ok == true) {
                             for (final f in _histSelected) { await JobStore.delete(f); }
-                            if (!mounted) return;
+                            if (!context.mounted) return;
                             setState(() {
                               _histSelecting = false;
                               _histSelected.clear();
@@ -4954,7 +4972,7 @@ _coverageDistanceCacheM = 0.0;
                     crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       Material(
-                        color: Theme.of(context).colorScheme.surfaceContainerHighest.withOpacity(0.5),
+                        color: Theme.of(context).colorScheme.surfaceContainerHighest.withValues(alpha: 0.5),
                         child: InkWell(
                           onLongPress: () {
                             setState(() {
@@ -4998,7 +5016,7 @@ _coverageDistanceCacheM = 0.0;
                                           _areaText(dayTotalHa),
                                           '${dayAvgCoverage.toStringAsFixed(0)}% avg',
                                           if (dayAvgRate != null)
-                                            '${dayAvgRate.toStringAsFixed(0)} ${dayRateUnit}/ha avg',
+                                            '${dayAvgRate.toStringAsFixed(0)} $dayRateUnit/ha avg',
                                           if (dayWeather != null) dayWeather,
                                         ].join(' · '),
                                         style: TextStyle(
@@ -5117,7 +5135,7 @@ _coverageDistanceCacheM = 0.0;
         paths.add(Polyline(
           points: job.path,
           strokeWidth: 2.5,
-          color: _swathColor.withOpacity(_swathOpacity),
+          color: _swathColor.withValues(alpha: _swathOpacity),
         ));
       }
     }
@@ -5164,7 +5182,7 @@ _coverageDistanceCacheM = 0.0;
       _historySwathPolys.clear();
       _historyPathPolylines.clear();
     });
-    _resetToMapDefaults();
+    _restoreSavedMapView();
   }
 
   Widget _completedJobSummaryPanel() {
@@ -5183,7 +5201,7 @@ _coverageDistanceCacheM = 0.0;
             label,
             style: TextStyle(
               fontSize: 11,
-              color: scheme.onSecondaryContainer.withOpacity(0.75),
+              color: scheme.onSecondaryContainer.withValues(alpha: 0.75),
             ),
           ),
           Text(
@@ -5289,7 +5307,7 @@ _coverageDistanceCacheM = 0.0;
                             isDense: true,
                             labelText: 'Scale reading (${load.unitLabel})',
                             labelStyle: TextStyle(
-                              color: scheme.onSecondaryContainer.withOpacity(0.75),
+                              color: scheme.onSecondaryContainer.withValues(alpha: 0.75),
                             ),
                             hintText: 'Optional',
                             border: const OutlineInputBorder(),
@@ -5570,7 +5588,7 @@ _coverageDistanceCacheM = 0.0;
                     color: Theme.of(ctx)
                         .colorScheme
                         .surfaceContainerHighest
-                        .withOpacity(0.55),
+                        .withValues(alpha: 0.55),
                     child: Padding(
                       padding: const EdgeInsets.fromLTRB(16, 10, 16, 10),
                       child: Column(
@@ -5727,25 +5745,6 @@ _coverageDistanceCacheM = 0.0;
   // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
-    if (_navMode && _inPipMode) {
-      return Material(
-        type: MaterialType.transparency,
-        color: Colors.black,
-        child: Center(
-          child: ValueListenableBuilder<double>(
-            valueListenable: _signedErrorNotifier,
-            builder: (context, signedErrorM, _) => _ErrorChevronHud(
-              signedErrorM: signedErrorM,
-              chevronsPerSide: 2,
-              controller: _chevCtrl,
-              rowWidthMeters: _toMeters(_width <= 0 ? 3.0 : _width),
-              pipMode: true,
-            ),
-          ),
-        ),
-      );
-    }
-
     final safe = MediaQuery.of(context).padding;
     final startCenter = _dispPos ?? _currentPos ?? const LatLng(-37.6710, 175.6860);
 
@@ -5811,7 +5810,7 @@ _coverageDistanceCacheM = 0.0;
             height: 18,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: _guidanceColor.withOpacity(0.95),
+              color: _guidanceColor.withValues(alpha: 0.95),
               border: Border.all(color: Colors.white, width: 2.5),
               boxShadow: const [BoxShadow(color: Colors.black38, blurRadius: 4)],
             ),
@@ -5833,7 +5832,7 @@ _coverageDistanceCacheM = 0.0;
             polylines: [
               Polyline(
                 points: [pos, _pointA!],
-                color: _guidanceColor.withOpacity(0.85),
+                color: _guidanceColor.withValues(alpha: 0.85),
                 strokeWidth: 3.5,
                 isDotted: true,
               ),
@@ -5880,7 +5879,7 @@ _coverageDistanceCacheM = 0.0;
             mapController: _mapController,
             options: MapOptions(
               initialCenter: startCenter,
-              initialZoom: 16.0,
+              initialZoom: _savedZoom,
               onTap: _onMapTap,
               onLongPress: (tp, latlng) {
                 if (_editorMode &&
@@ -5916,24 +5915,14 @@ _coverageDistanceCacheM = 0.0;
               onMapReady: () {
                 setState(() {
                   _mapReady = true;
+                  // Start from the remembered map view (north up on a fresh
+                  // session) and keep following the tractor.
+                  _rotationMode = _savedRotationMode;
+                  _followGps = true;
                   _maybeAutoSelectPaddockFromGps();
                 });
                 _rebuildPaddockLayers();
-                _runAfterMapFrame(() {
-                  if (_followGps && _dispPos != null) {
-                    final hdg = _rotationMode == RotationMode.travelUp
-                        ? _tractorHeadingDeg()
-                        : null;
-                    _swoopCamera(
-                      center: _dispPos,
-                      rotationDeg: hdg != null
-                          ? -hdg
-                          : (_rotationMode == RotationMode.northUp ? 0 : null),
-                    );
-                  } else {
-                    _applyMapRotation(0);
-                  }
-                });
+                _runAfterMapFrame(_restoreSavedMapView);
               },
               onPositionChanged: _onMapPositionChanged,
               onMapEvent: _onMapEvent,
@@ -6004,7 +5993,7 @@ _coverageDistanceCacheM = 0.0;
                 PolygonLayer(polygons: [
                   Polygon(
                     points: _tempOuter,
-                    color: Theme.of(context).colorScheme.secondary.withOpacity(0.10),
+                    color: Theme.of(context).colorScheme.secondary.withValues(alpha: 0.10),
                     borderColor: Theme.of(context).colorScheme.secondary,
                     borderStrokeWidth: 1.2,
                   )
@@ -6041,7 +6030,7 @@ _coverageDistanceCacheM = 0.0;
                 PolygonLayer(polygons: [
                   Polygon(
                     points: _tempHole,
-                    color: Colors.red.withOpacity(0.08),
+                    color: Colors.red.withValues(alpha: 0.08),
                     borderColor: Colors.redAccent,
                     borderStrokeWidth: 1.2,
                   )
@@ -6854,14 +6843,12 @@ class _ErrorChevronHud extends StatelessWidget {
   final int chevronsPerSide;
   final AnimationController controller;
   final double rowWidthMeters;
-  final bool pipMode;
 
   const _ErrorChevronHud({
     required this.signedErrorM,
     required this.chevronsPerSide,
     required this.controller,
     required this.rowWidthMeters,
-    this.pipMode = false,
   });
 
   Color _gradColorFromCenter(int idxFromCenter, int total) {
@@ -6889,11 +6876,11 @@ class _ErrorChevronHud extends StatelessWidget {
       return AnimatedBuilder(
         animation: controller,
         builder: (_, __) {
-          final baseAlpha = 0.35; // dark grey base
+          const baseAlpha = 0.35; // dark grey base
 
           return LayoutBuilder(
             builder: (ctx, constraints) {
-              final reservedForCenter = 100.0; // room for the error box and padding
+              const reservedForCenter = 100.0; // room for the error box and padding
               final availPerSide = ((constraints.maxWidth - reservedForCenter) / 2)
                   .clamp(76.0, 320.0);
 
@@ -6921,7 +6908,7 @@ class _ErrorChevronHud extends StatelessWidget {
                 final eased = Curves.easeInOut.transform(pulse);
 
                 final overlayColor = _gradColorFromCenter(spatialIdxFromCenter, chevronsPerSide)
-                    .withOpacity(isActive ? (0.18 + 0.82 * eased) : 0.0);
+                    .withValues(alpha: isActive ? (0.18 + 0.82 * eased) : 0.0);
 
                 tiles.add(Container(
                   margin: EdgeInsets.only(
@@ -6936,7 +6923,7 @@ class _ErrorChevronHud extends StatelessWidget {
                       CustomPaint(
                         painter: _ChevronPainter(
                           right: isRightSide,
-                          color: Colors.grey.shade800.withOpacity(baseAlpha),
+                          color: Colors.grey.shade800.withValues(alpha: baseAlpha),
                           thickness: baseThickness,
                         ),
                       ),
@@ -6967,7 +6954,7 @@ class _ErrorChevronHud extends StatelessWidget {
       margin: const EdgeInsets.only(top: 2),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
       decoration: BoxDecoration(
-        color: Colors.black.withOpacity(0.32),
+        color: Colors.black.withValues(alpha: 0.32),
         borderRadius: BorderRadius.circular(12),
       ),
       child: Row(
@@ -6978,7 +6965,7 @@ class _ErrorChevronHud extends StatelessWidget {
           Container(
             padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
             decoration: BoxDecoration(
-              color: Colors.black.withOpacity(0.66),
+              color: Colors.black.withValues(alpha: 0.66),
               borderRadius: BorderRadius.circular(8),
             ),
             child: Text(
@@ -7208,7 +7195,7 @@ class _AppVersionTileState extends State<_AppVersionTile> {
           }
         } else {
           // _latestVersion is null or empty
-          subtitle = '$currentVersion';
+          subtitle = currentVersion;
           icon = Icons.check_circle;
           trailing = IconButton(
             icon: const Icon(Icons.refresh),

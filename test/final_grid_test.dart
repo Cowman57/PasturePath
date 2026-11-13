@@ -1,13 +1,13 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:latlong2/latlong.dart';
-import '../lib/services/geometry.dart';
+import 'package:tractorgps/services/geometry.dart';
 
 void main() {
   group('Grid-based accurate area calculations', () {
     test('Straight line basic case', () {
       final path = [
-        LatLng(-37.0, 175.0),
-        LatLng(-37.009, 175.0), // ~1000m south
+        const LatLng(-37.0, 175.0),
+        const LatLng(-37.009, 175.0), // ~1000m south
       ];
       
       const swathWidthM = 20.0;
@@ -27,10 +27,10 @@ void main() {
     test('Overlapping parallel lines - true area vs simple estimate', () {
       // Two parallel lines 1.5m apart with 20m swath = significant overlap
       final path = [
-        LatLng(-37.0, 175.0),
-        LatLng(-37.005, 175.0), // 500m south
-        LatLng(-37.005, 175.00015), // 1.5m east
-        LatLng(-37.0, 175.00015), // 500m north
+        const LatLng(-37.0, 175.0),
+        const LatLng(-37.005, 175.0), // 500m south
+        const LatLng(-37.005, 175.00015), // 1.5m east
+        const LatLng(-37.0, 175.00015), // 500m north
       ];
       
       const swathWidthM = 20.0;
@@ -62,8 +62,8 @@ void main() {
     
     test('Coverage percentage calculation', () {
       final path = [
-        LatLng(-37.0, 175.0),
-        LatLng(-37.009, 175.0), // ~1000m south
+        const LatLng(-37.0, 175.0),
+        const LatLng(-37.009, 175.0), // ~1000m south
       ];
       
       const swathWidthM = 20.0;

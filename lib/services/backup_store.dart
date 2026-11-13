@@ -197,11 +197,11 @@ class BackupStore {
 
   static void _validate(Map<String, dynamic> data) {
     if (data['format'] != _format) {
-      throw FormatException('Not a PasturePath backup file');
+      throw const FormatException('Not a PasturePath backup file');
     }
     final version = data['version'];
     if (version is! num || version > _version) {
-      throw FormatException('Unsupported backup version');
+      throw const FormatException('Unsupported backup version');
     }
   }
 
