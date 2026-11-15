@@ -45,3 +45,8 @@ app.*.map.json
 /android/app/release
 # Widget Preview related
 .widget_preview/
+
+# OrthoTiler build output. The bundled GDAL copy is ~107 MB, so the packaged
+# folder is distributed as a release asset rather than committed.
+/tools/ortho-tiler/bin/
+/tools/ortho-tiler/dist/

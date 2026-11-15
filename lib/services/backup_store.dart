@@ -52,6 +52,8 @@ class BackupStore {
     'boomLateralOffset',
     'selectedToolPresetName',
     'satellite',
+    'basemap',
+    'linzApiKey',
     'themeMode',
     'gpsInputMode',
     'gpsBaudRate',

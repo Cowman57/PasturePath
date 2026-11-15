@@ -25,6 +25,7 @@ import '../../services/last_load_prefs.dart';
 import '../../services/load_session_store.dart';
 import '../../services/paddock_work_list_store.dart';
 import '../../services/map_tile_cache.dart';
+import '../../services/ortho_layer_store.dart';
 import '../../services/weather_service.dart';
 import '../../models/job_weather.dart';
 import '../../services/geometry.dart';
@@ -50,6 +51,47 @@ enum EditorTool { browse, drawOuter, drawHole, edit }
 
 
 enum RotationMode { northUp, travelUp, free }
+
+/// Selectable basemap.
+///
+/// [openAerialMap] uses HOT's global OpenAerialMap mosaic, which is plain XYZ and
+/// CORS-safe. Note it renders a coverage grid below zoom 14 and real imagery from
+/// zoom 14 up, and its imagery comes from many contributors with mixed licences.
+enum BasemapType { streets, esriSatellite, openAerialMap, linzAerial }
+
+extension BasemapTypeX on BasemapType {
+  String get prefsValue => switch (this) {
+        BasemapType.streets => 'streets',
+        BasemapType.esriSatellite => 'esri',
+        BasemapType.openAerialMap => 'oam',
+        BasemapType.linzAerial => 'linz',
+      };
+
+  String get label => switch (this) {
+        BasemapType.streets => 'Street map (OSM)',
+        BasemapType.esriSatellite => 'Satellite (Esri)',
+        BasemapType.openAerialMap => 'Aerial (OpenAerialMap)',
+        BasemapType.linzAerial => 'Aerial (LINZ NZ)',
+      };
+
+  /// Attribution required by the provider's terms of use.
+  String get attribution => switch (this) {
+        BasemapType.streets => '© OpenStreetMap contributors',
+        BasemapType.esriSatellite => 'Esri, Maxar, Earthstar Geographics',
+        BasemapType.openAerialMap => '© OpenAerialMap contributors',
+        BasemapType.linzAerial =>
+          '© LINZ CC BY 4.0 © Imagery Basemap contributors',
+      };
+
+  /// Resolves the stored value, falling back to the legacy `satellite` boolean.
+  static BasemapType fromPrefs(String? value, {bool? legacySatellite}) {
+    for (final t in BasemapType.values) {
+      if (t.prefsValue == value) return t;
+    }
+    if (legacySatellite == true) return BasemapType.esriSatellite;
+    return BasemapType.streets;
+  }
+}
 
 class MapScreen extends StatefulWidget {
   const MapScreen({super.key, required this.themeController});
@@ -101,9 +143,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   ToolSetupDimensions _toolDims = const ToolSetupDimensions();
   List<ToolPreset> _toolPresets = [];
   String? _selectedToolPresetName;
-  bool _satellite = false;
+  BasemapType _basemap = BasemapType.streets;
+  /// Free key from basemaps.linz.govt.nz; required for the LINZ layer.
+  String _linzApiKey = '';
   bool _accurateCalculations = true;
   TileProvider? _mapTileProvider;
+  /// User-imported orthomosaics (MBTiles) drawn above the basemap. Visual only:
+  /// no area, distance, coverage or guidance maths reads these.
+  List<OrthoLayer> _orthoLayers = [];
+  bool _orthoImporting = false;
 
   static const Color _overlayColor = Colors.green;
   static const double _overlayOpacity = 0.20;
@@ -732,6 +780,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     try {
       await _loadPrefs();
       if (!mounted) return;
+      final orthoLayers = await OrthoLayerStore.list();
+      if (!mounted) return;
+      setState(() => _orthoLayers = orthoLayers);
       _toolPresets = await ToolPresetStore.list();
       if (_selectedToolPresetName != null) {
         final ok = _toolPresets.any(
@@ -792,7 +843,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         gpsLateralOffset: p.getDouble('gpsLateralOffset') ?? 0.0,
         hitchToAxle: p.getDouble('hitchToAxle') ?? p.getDouble('drawbarLength') ?? 3.0,
       );
-      _satellite = p.getBool('satellite') ?? false;
+      _basemap = BasemapTypeX.fromPrefs(
+      p.getString('basemap'),
+      legacySatellite: p.getBool('satellite'),
+    );
+    _linzApiKey = p.getString('linzApiKey') ?? '';
       _accurateCalculations = p.getBool('accurateCalculations') ?? true;
       _gpsSmoothness = p.getDouble('gpsSmoothness') ?? 0.0;
       _gpsSmoother.smoothness = _gpsSmoothness;
@@ -842,7 +897,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     await p.setDouble('gpsLateralOffset', _toolDims.gpsLateralOffset);
     await p.setDouble('hitchToAxle', _toolDims.hitchToAxle);
     await p.setDouble('drawbarLength', _toolDims.hitchToAxle);
-    await p.setBool('satellite', _satellite);
+    await p.setString('basemap', _basemap.prefsValue);
+    await p.setString('linzApiKey', _linzApiKey);
+    // Kept for backwards compatibility with older backups/readers.
+    await p.setBool('satellite', _basemap == BasemapType.esriSatellite);
     await p.setBool('accurateCalculations', _accurateCalculations);
     await p.setString(ThemeController.prefsKey, ThemeController.toPrefs(widget.themeController.mode));
     await p.setDouble('gpsSmoothness', _gpsSmoothness);
@@ -862,7 +920,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     'gpsLateralOffset': _toolDims.gpsLateralOffset,
     'hitchToAxle': _toolDims.hitchToAxle,
     'drawbarLength': _toolDims.hitchToAxle,
-    'satellite': _satellite,
+    'satellite': _basemap == BasemapType.esriSatellite,
+    'basemap': _basemap.prefsValue,
+    'linzApiKey': _linzApiKey,
     'accurateCalculations': _accurateCalculations,
     ThemeController.prefsKey: ThemeController.toPrefs(widget.themeController.mode),
     'gpsSmoothness': _gpsSmoothness,
@@ -3768,10 +3828,13 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     _closeEndDrawer();
 
-    const osmUrl = 'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
-    const satUrl =
-        'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
-    final url = _satellite ? satUrl : osmUrl;
+    // No {s} subdomains here: the cache dialog builds URLs directly.
+    final url = switch (_basemap) {
+      BasemapType.streets => _osmTileUrl,
+      BasemapType.esriSatellite => _esriTileUrl,
+      BasemapType.openAerialMap => _oamTileUrl,
+      BasemapType.linzAerial => _linzTilesWithKey,
+    };
 
     if (!mounted) return;
     // Run prefetch inside the dialog so it always dismisses itself when done
@@ -4569,13 +4632,114 @@ _coverageDistanceCacheM = 0.0;
         const Divider(),
 
         const ListTile(title: Text('Map & Tiles', style: TextStyle(fontWeight: FontWeight.bold))),
-        SwitchListTile(
-          title: const Text('Satellite view (Esri)'),
-          value: _satellite,
-          onChanged: (v) {
-            setState(() => _satellite = v);
-            _savePrefs();
-          },
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 4, 16, 8),
+          child: DropdownButtonFormField<BasemapType>(
+            initialValue: _basemap,
+            decoration: const InputDecoration(
+              labelText: 'Basemap',
+              helperText: 'OpenAerialMap shows a coverage grid below zoom 14',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            items: [
+              for (final t in BasemapType.values)
+                DropdownMenuItem(value: t, child: Text(t.label)),
+            ],
+            onChanged: (v) {
+              if (v == null || v == _basemap) return;
+              setState(() => _basemap = v);
+              _savePrefs();
+              if (v == BasemapType.linzAerial && _linzApiKey.isEmpty) {
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('Paste your free LINZ API key below'),
+                  ),
+                );
+              }
+            },
+          ),
+        ),
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 8),
+          child: TextFormField(
+            initialValue: _linzApiKey,
+            autocorrect: false,
+            enableSuggestions: false,
+            decoration: const InputDecoration(
+              labelText: 'LINZ API key',
+              helperText: 'Free at basemaps.linz.govt.nz (expires every 90 days)',
+              border: OutlineInputBorder(),
+              isDense: true,
+            ),
+            onChanged: (v) {
+              final key = v.trim();
+              if (key == _linzApiKey) return;
+              setState(() => _linzApiKey = key);
+              _savePrefs();
+            },
+          ),
+        ),
+        ListTile(
+          title: const Text('Clear cached map tiles'),
+          subtitle: const Text('Removes downloaded tiles from this device'),
+          onTap: _clearTileCache,
+        ),
+        const ListTile(
+          title: Text('My imagery', style: TextStyle(fontWeight: FontWeight.bold)),
+        ),
+        for (final layer in _orthoLayers) ...[
+          SwitchListTile(
+            title: Text(layer.name),
+            subtitle: Text(
+              '${layer.sizeMb.toStringAsFixed(1)} MB · '
+              'z${layer.minZoom}–${layer.maxZoom}',
+            ),
+            value: layer.enabled,
+            onChanged: (v) {
+              setState(() => layer.enabled = v);
+              _persistOrthoLayers();
+            },
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 8, 4),
+            child: Row(
+              children: [
+                Expanded(
+                  child: Slider(
+                    value: layer.opacity.clamp(0.0, 1.0),
+                    divisions: 20,
+                    label: '${(layer.opacity * 100).round()}%',
+                    // Persist on release only: a drag fires onChanged far too
+                    // often to write SharedPreferences each time.
+                    onChanged: (v) {
+                      setState(() => layer.opacity = v);
+                    },
+                    onChangeEnd: (v) {
+                      layer.opacity = v;
+                      _persistOrthoLayers();
+                    },
+                  ),
+                ),
+                IconButton(
+                  tooltip: 'Remove ${layer.name}',
+                  icon: const Icon(Icons.delete_outline),
+                  onPressed: () => _confirmDeleteOrthoLayer(layer),
+                ),
+              ],
+            ),
+          ),
+        ],
+        ListTile(
+          leading: const Icon(Icons.add_photo_alternate_outlined),
+          title: const Text('Import .mbtiles…'),
+          subtitle: Text(
+            _orthoImporting
+                ? 'Importing…'
+                : 'Your own drone orthomosaic, drawn above the basemap',
+          ),
+          enabled: !_orthoImporting,
+          onTap: _importOrthoLayer,
         ),
         SwitchListTile(
           title: const Text('Accurate area calculations'),
@@ -5742,6 +5906,198 @@ _coverageDistanceCacheM = 0.0;
     );
   }
 
+  static const String _osmTileUrl =
+      'https://tile.openstreetmap.org/{z}/{x}/{y}.png';
+  static const String _esriTileUrl =
+      'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}';
+  /// HOT's global OpenAerialMap mosaic (plain XYZ, CORS-safe).
+  static const String _oamTileUrl =
+      'https://global.imagery.hotosm.org/{z}/{x}/{y}.png';
+
+  /// LINZ Basemaps nationwide aerial mosaic, EPSG:3857. Needs a free API key
+  /// (standard keys expire every 90 days).
+  static const String _linzTileUrl =
+      'https://basemaps.linz.govt.nz/v1/tiles/aerial/WebMercatorQuad/{z}/{x}/{y}.webp';
+
+  String get _linzTilesWithKey => '$_linzTileUrl?api=$_linzApiKey';
+
+  Future<void> _clearTileCache() async {
+    final removed = await MapTileCache.clear();
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('Cleared $removed cached map tiles')),
+    );
+  }
+
+  Widget _buildBasemapLayer() {
+    switch (_basemap) {
+      case BasemapType.streets:
+        return TileLayer(
+          // Single host, no {s} subdomains: OSM asks clients not to shard.
+          urlTemplate: _osmTileUrl,
+          userAgentPackageName: 'pasturepath',
+          maxNativeZoom: 19,
+          tileProvider: _mapTileProvider,
+        );
+      case BasemapType.esriSatellite:
+        return TileLayer(
+          urlTemplate: _esriTileUrl,
+          userAgentPackageName: 'pasturepath',
+          maxNativeZoom: 19,
+          tileProvider: _mapTileProvider,
+        );
+      case BasemapType.openAerialMap:
+        return TileLayer(
+          urlTemplate: _oamTileUrl,
+          userAgentPackageName: 'pasturepath',
+          maxNativeZoom: 22,
+          tileProvider: _mapTileProvider,
+        );
+      case BasemapType.linzAerial:
+        if (_linzApiKey.isEmpty) {
+          // No key yet — fall back to streets rather than 400-ing every tile.
+          return TileLayer(
+            urlTemplate: _osmTileUrl,
+            userAgentPackageName: 'pasturepath',
+            maxNativeZoom: 19,
+            tileProvider: _mapTileProvider,
+          );
+        }
+        return TileLayer(
+          urlTemplate: _linzTilesWithKey,
+          userAgentPackageName: 'pasturepath',
+          maxNativeZoom: 22,
+          tileProvider: _mapTileProvider,
+        );
+    }
+  }
+
+  // ---------- User imagery (imported MBTiles orthomosaics) ----------
+
+  /// Enabled orthomosaics, painted straight above the basemap so paddocks,
+  /// swaths, guidance and GPS all stay readable on top of them.
+  ///
+  /// Visual only — nothing here feeds area, distance or coverage maths.
+  List<Widget> _buildOrthoLayers() {
+    final widgets = <Widget>[];
+    for (final layer in _orthoLayers) {
+      if (!layer.enabled || layer.opacity <= 0) continue;
+      widgets.add(
+        Opacity(
+          opacity: layer.opacity.clamp(0.0, 1.0),
+          child: TileLayer(
+            tileProvider: OrthoMbTilesProvider(layer),
+            // Restricts tile requests to the orthomosaic's own footprint;
+            // tiles outside it simply aren't asked for.
+            tileBounds: layer.bounds.toLatLngBounds(),
+            minNativeZoom: layer.minZoom,
+            maxNativeZoom: layer.maxZoom,
+          ),
+        ),
+      );
+    }
+    return widgets;
+  }
+
+  Future<void> _persistOrthoLayers() => OrthoLayerStore.saveState(_orthoLayers);
+
+  Future<void> _importOrthoLayer() async {
+    if (_orthoImporting) return;
+    final messenger = ScaffoldMessenger.of(context);
+
+    FilePickerResult? picked;
+    try {
+      // FileType.any: Android has no MIME type for .mbtiles, so a custom
+      // extension filter would grey the file out on some pickers.
+      picked = await FilePicker.platform.pickFiles(
+        type: FileType.any,
+        withData: false,
+      );
+    } catch (e) {
+      messenger.showSnackBar(
+        SnackBar(content: Text('Could not open the file picker: $e')),
+      );
+      return;
+    }
+
+    final files = picked?.files ?? const <PlatformFile>[];
+    if (files.isEmpty) return; // Cancelled.
+    final pickedFile = files.first;
+    final path = pickedFile.path;
+    final name = pickedFile.name;
+    if (path == null) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('That file could not be read')),
+      );
+      return;
+    }
+    if (!name.toLowerCase().endsWith('.mbtiles')) {
+      messenger.showSnackBar(
+        const SnackBar(content: Text('Pick an .mbtiles file')),
+      );
+      return;
+    }
+
+    if (!mounted) return;
+    setState(() => _orthoImporting = true);
+    messenger.showSnackBar(
+      const SnackBar(content: Text('Importing imagery…')),
+    );
+
+    try {
+      final layer = await OrthoLayerStore.importFromPickedFile(
+        sourcePath: path,
+        originalName: name,
+      );
+      if (!mounted) return;
+      setState(() {
+        _orthoLayers = [..._orthoLayers, layer];
+        _orthoImporting = false;
+      });
+      await _persistOrthoLayers();
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(SnackBar(content: Text('Imported ${layer.name}')));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _orthoImporting = false);
+      messenger.hideCurrentSnackBar();
+      messenger.showSnackBar(SnackBar(content: Text('Import failed: $e')));
+    }
+  }
+
+  Future<void> _confirmDeleteOrthoLayer(OrthoLayer layer) async {
+    final messenger = ScaffoldMessenger.of(context);
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Remove "${layer.name}"?'),
+        content: const Text(
+          'The imported .mbtiles file is deleted from this device. '
+          'Paddocks and jobs are not affected.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    await OrthoLayerStore.delete(layer);
+    if (!mounted) return;
+    setState(() {
+      _orthoLayers = _orthoLayers.where((e) => e.id != layer.id).toList();
+    });
+    await _persistOrthoLayers();
+    messenger.showSnackBar(SnackBar(content: Text('Removed ${layer.name}')));
+  }
+
   // ---------- UI ----------
   @override
   Widget build(BuildContext context) {
@@ -5928,19 +6284,29 @@ _coverageDistanceCacheM = 0.0;
               onMapEvent: _onMapEvent,
             ),
             children: [
-              _satellite
-                  ? TileLayer(
-                urlTemplate: 'https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}',
-                userAgentPackageName: 'pasturepath',
-                maxNativeZoom: 19,
-                tileProvider: _mapTileProvider,
-              )
-                  : TileLayer(
-                urlTemplate: 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',
-                subdomains: const ['a', 'b', 'c'],
-                userAgentPackageName: 'pasturepath',
-                maxNativeZoom: 19,
-                tileProvider: _mapTileProvider,
+              _buildBasemapLayer(),
+              ..._buildOrthoLayers(),
+              IgnorePointer(
+                child: Align(
+                  alignment: Alignment.bottomLeft,
+                  child: Padding(
+                    padding: const EdgeInsets.only(left: 8, bottom: 6),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 6,
+                        vertical: 2,
+                      ),
+                      color: Colors.black54,
+                      child: Text(
+                        _basemap.attribution,
+                        style: const TextStyle(
+                          color: Colors.white70,
+                          fontSize: 10,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
               ),
 
               // Draw paddocks first

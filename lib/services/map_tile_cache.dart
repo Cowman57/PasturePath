@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:ui' as ui;
@@ -16,7 +17,10 @@ class MapTileCache {
 
   static io.Directory? _dir;
   static TileProvider? _provider;
-  static const _userAgent = 'PasturePath/1.0 (farm guidance; offline cache)';
+  /// Identifies the app and a contact per OSM's tile usage policy. A bare or
+  /// generic User-Agent is what gets clients blocked.
+  static const _userAgent =
+      'PasturePath/4.2.0 (+https://github.com/Cowman57/PasturePath)';
 
   static Future<io.Directory> cacheDirectory() async {
     if (_dir != null) return _dir!;
@@ -39,6 +43,89 @@ class MapTileCache {
         .replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_')
         .replaceAll(RegExp(r'_+'), '_');
     return '${dir.path}/$safe';
+  }
+
+  /// 1x1 transparent PNG, used where a provider has no imagery (HTTP 204/404)
+  /// so coverage gaps render as blank instead of throwing per tile.
+  static final Uint8List _transparentPixel = base64Decode(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==',
+  );
+
+  /// Same blank pixel, for other tile providers that have no imagery to show.
+  static Uint8List get transparentPixel => _transparentPixel;
+
+  /// Freshness used when the server sends no usable Cache-Control.
+  /// Tiles must never be cached permanently again: a bad response (e.g. a block
+  /// page served with HTTP 200) would otherwise be baked in forever.
+  static const Duration defaultTtl = Duration(days: 7);
+
+  static String _expiryPath(String tileFilePath) => '$tileFilePath.exp';
+
+  static Duration? _parseMaxAge(String? cacheControl) {
+    if (cacheControl == null) return null;
+    final m = RegExp(r'max-age\s*=\s*(\d+)').firstMatch(cacheControl);
+    final seconds = m == null ? null : int.tryParse(m.group(1)!);
+    if (seconds == null) return null;
+    // Cap at 30 days so caching stays bounded.
+    return Duration(seconds: seconds.clamp(0, 30 * 24 * 3600));
+  }
+
+  static Future<bool> _isFresh(String tileFilePath) async {
+    try {
+      final f = io.File(_expiryPath(tileFilePath));
+      if (!await f.exists()) return false;
+      final expiry = int.tryParse((await f.readAsString()).trim());
+      if (expiry == null) return false;
+      return DateTime.now().millisecondsSinceEpoch < expiry;
+    } catch (_) {
+      return false;
+    }
+  }
+
+  static Future<void> _writeExpiry(String tileFilePath, Duration ttl) async {
+    try {
+      await io.File(_expiryPath(tileFilePath)).writeAsString(
+        '${DateTime.now().add(ttl).millisecondsSinceEpoch}',
+        flush: false,
+      );
+    } catch (_) {}
+  }
+
+  /// True only for real image payloads. Rejects HTML/text error pages that some
+  /// servers return with a 200 status.
+  static bool looksLikeImage(Uint8List b) {
+    if (b.length < 12) return false;
+    if (b[0] == 0x89 && b[1] == 0x50 && b[2] == 0x4E && b[3] == 0x47) return true; // PNG
+    if (b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF) return true; // JPEG
+    if (b[0] == 0x47 && b[1] == 0x49 && b[2] == 0x46) return true; // GIF
+    if (b[0] == 0x52 &&
+        b[1] == 0x49 &&
+        b[2] == 0x46 &&
+        b[3] == 0x46 &&
+        b[8] == 0x57 &&
+        b[9] == 0x45 &&
+        b[10] == 0x42 &&
+        b[11] == 0x50) {
+      return true; // WebP
+    }
+    return false;
+  }
+
+  /// Deletes every cached tile. Returns the number of files removed.
+  static Future<int> clear() async {
+    final dir = await cacheDirectory();
+    var removed = 0;
+    try {
+      await for (final e in dir.list(followLinks: false)) {
+        if (e is io.File) {
+          try {
+            await e.delete();
+            removed++;
+          } catch (_) {}
+        }
+      }
+    } catch (_) {}
+    return removed;
   }
 
   /// Prefetch OSM (or given template) tiles covering [bounds] for [minZoom]–[maxZoom].
@@ -202,22 +289,56 @@ class _CachedTileImage extends ImageProvider<_CachedTileImage> {
 
   Future<ui.Codec> _load(ImageDecoderCallback decode) async {
     final file = io.File(filePath);
-    late final Uint8List bytes;
-    if (await file.exists()) {
-      bytes = await file.readAsBytes();
-    } else {
-      final res = await http.get(
-        Uri.parse(url),
-        headers: {'User-Agent': MapTileCache._userAgent},
-      ).timeout(const Duration(seconds: 12));
-      if (res.statusCode != 200) {
-        throw StateError('Tile HTTP ${res.statusCode}');
-      }
-      bytes = res.bodyBytes;
+
+    // Serve a fresh, valid cached tile. Anything stale, unparsable or not an
+    // image is discarded so a poisoned cache heals itself.
+    if (await file.exists() && await MapTileCache._isFresh(filePath)) {
       try {
-        await file.writeAsBytes(bytes, flush: false);
+        final cached = await file.readAsBytes();
+        if (MapTileCache.looksLikeImage(cached)) {
+          final buffer = await ui.ImmutableBuffer.fromUint8List(cached);
+          return await decode(buffer);
+        }
+      } catch (_) {}
+      try {
+        await file.delete();
       } catch (_) {}
     }
+
+    final res = await http.get(
+      Uri.parse(url),
+      headers: {'User-Agent': MapTileCache._userAgent},
+    ).timeout(const Duration(seconds: 12));
+
+    // 204/404 means the provider has no imagery here (e.g. OpenAerialMap
+    // coverage gaps). Render blank rather than throwing for every tile.
+    if (res.statusCode == 204 || res.statusCode == 404) {
+      final buffer =
+          await ui.ImmutableBuffer.fromUint8List(MapTileCache._transparentPixel);
+      return decode(buffer);
+    }
+
+    if (res.statusCode != 200) {
+      throw StateError('Tile HTTP ${res.statusCode} for $url');
+    }
+
+    final contentType = res.headers['content-type'] ?? '';
+    final bytes = res.bodyBytes;
+    if (!contentType.startsWith('image/') ||
+        !MapTileCache.looksLikeImage(bytes)) {
+      // Never cache a non-image payload (block pages, HTML errors, ...).
+      final buffer =
+          await ui.ImmutableBuffer.fromUint8List(MapTileCache._transparentPixel);
+      return decode(buffer);
+    }
+
+    try {
+      await file.writeAsBytes(bytes, flush: false);
+      final ttl = MapTileCache._parseMaxAge(res.headers['cache-control']) ??
+          MapTileCache.defaultTtl;
+      await MapTileCache._writeExpiry(filePath, ttl);
+    } catch (_) {}
+
     final buffer = await ui.ImmutableBuffer.fromUint8List(bytes);
     return decode(buffer);
   }
