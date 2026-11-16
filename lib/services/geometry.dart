@@ -707,16 +707,90 @@ List<List<LatLng>> splitPathAtJumps(List<LatLng> path, {double maxJumpM = 40}) {
   return segments;
 }
 
+/// Splits [path] into runs of continuous travel, marking each as reversing or
+/// forward.
+///
+/// A reversal is detected when the step bearing flips by more than
+/// [maxReverseDeg], which toggles the direction. Detecting the *run* rather than
+/// a single step matters: once the machine starts backing up, every subsequent
+/// step is forward relative to the new travel bearing, so a per-step test would
+/// only ever flag the first sample of the reversal.
+List<({List<LatLng> points, bool reversing})> splitPathByTravelDirection(
+  List<LatLng> path, {
+  double maxReverseDeg = 95,
+  double minStepM = 0.8,
+}) {
+  if (path.length < 2) {
+    return path.isEmpty
+        ? const []
+        : [(points: List<LatLng>.from(path), reversing: false)];
+  }
+
+  final runs = <({List<LatLng> points, bool reversing})>[];
+  var current = <LatLng>[path.first];
+  var reversing = false;
+  double? travel;
+
+  for (var i = 1; i < path.length; i++) {
+    final curr = path[i];
+    if (_distMeters(current.last, curr) < minStepM) {
+      // Too short to judge direction (GPS jitter); keep it so the run stays
+      // continuous, but don't let it toggle the travel direction.
+      current.add(curr);
+      continue;
+    }
+
+    final stepBearing = _bearingDeg(current.last, curr);
+    if (travel != null &&
+        _angleDiffDeg(travel, stepBearing).abs() > maxReverseDeg) {
+      // Direction flipped: close this run and start the next one the other way.
+      if (current.length >= 2) {
+        runs.add((points: List<LatLng>.from(current), reversing: reversing));
+      }
+      reversing = !reversing;
+      current = <LatLng>[current.last];
+    }
+
+    current.add(curr);
+    travel = stepBearing;
+  }
+
+  if (current.length >= 2) {
+    runs.add((points: List<LatLng>.from(current), reversing: reversing));
+  }
+  return runs;
+}
+
+/// Forward-travel runs only — the stretches where product is actually applied.
+///
+/// Reversing legs stay in the recorded path (so the track is continuous) but
+/// produce no swath: the operator backs into position and only starts applying
+/// on the way out.
+List<List<LatLng>> forwardRunsOnly(
+  List<LatLng> path, {
+  double maxReverseDeg = 95,
+}) {
+  return [
+    for (final run
+        in splitPathByTravelDirection(path, maxReverseDeg: maxReverseDeg))
+      if (!run.reversing) run.points,
+  ];
+}
+
 /// One closed ring per continuous forward path segment.
 List<List<LatLng>> buildSwathRingsFromPath(List<LatLng> path, double widthM) {
   final rings = <List<LatLng>>[];
-  final forward = filterForwardGpsPath(path);
-  for (final jumpSeg in splitPathAtJumps(forward)) {
-    for (final seg in splitPathAtReversals(jumpSeg)) {
-      final simplified = simplifySwathPath(seg);
-      if (simplified.length < 2) continue;
-      final ring = buildSwathRingFromPath(simplified, widthM);
-      if (ring.length >= 3) rings.add(ring);
+  // Split by travel direction BEFORE any filtering: filtering first deletes the
+  // reversal points, which then paints a phantom straight strip across the
+  // corner instead of leaving it uncovered.
+  for (final jumpSeg in splitPathAtJumps(path)) {
+    for (final forwardRun in forwardRunsOnly(jumpSeg)) {
+      for (final seg in splitPathAtReversals(forwardRun)) {
+        final simplified = simplifySwathPath(seg);
+        if (simplified.length < 2) continue;
+        final ring = buildSwathRingFromPath(simplified, widthM);
+        if (ring.length >= 3) rings.add(ring);
+      }
     }
   }
   return rings;

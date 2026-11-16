@@ -3,6 +3,7 @@ import 'dart:async';
 import 'dart:io' as io;
 import 'dart:math' as math;
 import 'dart:convert';
+import 'dart:ui' as ui;
 
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
@@ -90,6 +91,134 @@ extension BasemapTypeX on BasemapType {
     }
     if (legacySatellite == true) return BasemapType.esriSatellite;
     return BasemapType.streets;
+  }
+}
+
+/// Parallel guidance lines struck through with a prohibition slash, signalling
+/// "remove the guidance line". Drawn rather than an icon font so it reads the
+/// same at any button diameter.
+class _GuidanceRemoveGlyphPainter extends CustomPainter {
+  const _GuidanceRemoveGlyphPainter({required this.color});
+
+  final Color color;
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Offset center = size.center(Offset.zero);
+    final double radius = size.shortestSide / 2;
+    final double inner = radius * 0.92;
+
+    canvas.drawCircle(
+      center,
+      inner,
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeWidth = size.shortestSide * 0.07
+        ..color = color,
+    );
+
+    // Three swath lines, tilted halfway between the old slant and vertical, and
+    // running across the prohibition slash so the two directions stay distinct.
+    // The middle line is solid and the outer two are dotted, mirroring how the
+    // active and inactive swaths are drawn on the map.
+    const double slope = 1.75;
+    final double norm = math.sqrt(1 + slope * slope);
+    final Offset along = Offset(1 / norm, slope / norm);
+    final Offset across = Offset(-along.dy, along.dx);
+    final double spacing = size.shortestSide * 0.15;
+    final double reach = radius * 1.7;
+
+    final Paint solidLine = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..color = color
+      ..strokeWidth = size.shortestSide * 0.042;
+
+    final Paint dottedLine = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeCap = StrokeCap.round
+      ..color = color
+      ..strokeWidth = size.shortestSide * 0.038;
+
+    canvas.save();
+    // latlong2 exports its own `Path`, so the ui.Path has to be explicit here.
+    canvas.clipPath(
+      ui.Path()..addOval(Rect.fromCircle(center: center, radius: inner)),
+    );
+
+    for (int i = -1; i <= 1; i++) {
+      final Offset base = center + across * (i * spacing);
+      final Offset start = base - along * reach;
+      final Offset end = base + along * reach;
+      if (i == 0) {
+        canvas.drawLine(start, end, solidLine);
+      } else {
+        _drawDashed(
+          canvas,
+          start,
+          end,
+          dottedLine,
+          size.shortestSide * 0.06,
+          size.shortestSide * 0.055,
+        );
+      }
+    }
+
+    canvas.restore();
+
+    // Prohibition slash.
+    canvas.drawLine(
+      Offset(size.width * 0.19, size.height * 0.81),
+      Offset(size.width * 0.81, size.height * 0.19),
+      Paint()
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round
+        ..strokeWidth = size.shortestSide * 0.105
+        ..color = color,
+    );
+  }
+
+  /// Draws [paint] from [a] to [b] as a dashed run, so the outer swath lines
+  /// read as active/inactive guidance rather than solid bars.
+  static void _drawDashed(
+    Canvas canvas,
+    Offset a,
+    Offset b,
+    Paint paint,
+    double dash,
+    double gap,
+  ) {
+    final Offset delta = b - a;
+    final double total = delta.distance;
+    if (total <= 0 || dash <= 0) return;
+    final Offset step = delta / total;
+    double travelled = 0;
+    while (travelled < total) {
+      final double end = math.min(travelled + dash, total);
+      canvas.drawLine(a + step * travelled, a + step * end, paint);
+      travelled = end + gap;
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant _GuidanceRemoveGlyphPainter oldDelegate) {
+    return oldDelegate.color != color;
+  }
+}
+
+/// Sizes the remove-guidance glyph to a round action button.
+class _GuidanceRemoveGlyph extends StatelessWidget {
+  const _GuidanceRemoveGlyph({required this.color, required this.size});
+
+  final Color color;
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      size: Size.square(size),
+      painter: _GuidanceRemoveGlyphPainter(color: color),
+    );
   }
 }
 
@@ -239,6 +368,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   double _speedDistanceM = 0.0; // ∫ GPS speed dt (metres)
   DateTime? _lastSpeedFixTime;
   double _currentSpeedKph = 0.0;
+  /// Distance and time accumulated only while genuinely working. Feeds the
+  /// working-speed average used by the target-speed suggestion, so stops,
+  /// filling and ramp-up cannot drag the recommendation down.
+  double _movingDistanceM = 0.0;
+  double _movingTimeS = 0.0;
   /// Cached coverage path length (same basis as job save).
   double _coverageDistanceCacheM = 0.0;
   int _coverageDistanceCacheMs = 0;
@@ -265,7 +399,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   int? _lastSwathRecordBucket;
   int? _lastSpeedSampleBucket;
   static const int _navSampleBucketMs = 40;
+  /// Speeds outside this band are not "working": below it the machine is stopped
+  /// or manoeuvring, above it the fix is almost certainly a GPS spike.
+  static const double _workingSpeedMinKph = 3.0;
+  static const double _workingSpeedMaxKph = 45.0;
   static const double _minGpsRecordM = 0.45;
+  /// Backwards steps shorter than this are treated as GPS jitter. Anything
+  /// longer is a genuine reversal and must be recorded.
+  static const double _reverseJitterMaxM = 0.8;
   static const double _maxGpsJumpM = 35.0;
   /// Stronger simplify on save keeps job files smaller for history / map show.
   static const double _jobSaveSimplifyMinDistM = 1.25;
@@ -1743,8 +1884,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final target = session.primaryTargetRatePerHa;
     if (actual <= 0 || target <= 0) return;
 
-    final avgSpeed = _completedJobSummary?.avgSpeedKph ??
-        _navLiveAvgSpeedKph();
+    // Scale from the WORKING speed, not the elapsed-time average: stops must not
+    // pull the suggestion down. Saved jobs don't carry moving time yet, so no
+    // recommendation is offered for them rather than a misleading one.
+    if (_completedJobSummary != null) {
+      if (!mounted) return;
+      setState(() => _suggestedTargetSpeedKph = null);
+      return;
+    }
+    final avgSpeed = _navLiveWorkingSpeedKph();
     if (avgSpeed <= 0) return;
 
     final coverage = _completedJobSummary != null
@@ -2438,6 +2586,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     return (_speedDistanceM / 1000.0) / hrs;
   }
 
+  /// Distance ÷ moving time — the rate-effective speed.
+  ///
+  /// Applied rate ∝ 1/speed, so this is the figure the target-speed suggestion
+  /// must scale from: elapsed-time averages include every stop and read low.
+  double _navLiveWorkingSpeedKph() {
+    if (_movingTimeS <= 0) return _navLiveAvgSpeedKph();
+    return (_movingDistanceM / 1000.0) / (_movingTimeS / 3600.0);
+  }
+
   Widget _navDashboard() {
     final topPad = MediaQuery.of(context).padding.top;
     Widget stat(String label, String value) {
@@ -2475,7 +2632,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                 '${_suggestedTargetSpeedKph!.toStringAsFixed(1)} km/h',
               )
             else
-              stat('Avg', '${_navLiveAvgSpeedKph().toStringAsFixed(1)} km/h'),
+              stat(
+                'Work',
+                '${_navLiveWorkingSpeedKph().toStringAsFixed(1)} km/h',
+              ),
             stat('Covered', _areaText(_accurateCalculations ? _navLiveAppliedAreaHaAccurate() : _navLiveAppliedAreaHa())),
             stat('Coverage', '${(_accurateCalculations ? _navLiveCoveragePercentAccurate() : _navLiveCoveragePercent()).toStringAsFixed(0)}%'),
           ],
@@ -2490,24 +2650,26 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     required VoidCallback onPressed,
     String? letter,
     IconData? icon,
+    Widget? glyph,
     String? heroTag,
     double diameter = _fabDiameter,
     bool expandHit = true,
   }) {
-    assert(letter != null || icon != null);
+    assert(letter != null || icon != null || glyph != null);
     final hitExtend = expandHit ? diameter / 2 : 0.0;
     final face = _floatingCircleFace(
       diameter: diameter,
-      child: letter != null
-          ? Text(
-              letter,
-              style: TextStyle(
-                fontSize: diameter * 0.39,
-                fontWeight: FontWeight.w800,
-                color: _fabContent,
-              ),
-            )
-          : Icon(icon, size: diameter * 0.47, color: _fabContent),
+      child: glyph ??
+          (letter != null
+              ? Text(
+                  letter,
+                  style: TextStyle(
+                    fontSize: diameter * 0.39,
+                    fontWeight: FontWeight.w800,
+                    color: _fabContent,
+                  ),
+                )
+              : Icon(icon, size: diameter * 0.47, color: _fabContent)),
     );
     final wrapped = heroTag == null
         ? face
@@ -2752,9 +2914,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   double _hitchToAxleM() => _toMeters(_toolDims.hitchToAxle);
 
   void _rebuildJobPathFromGps() {
-    final forward = filterForwardGpsPath(_gpsRecordPath);
+    // Keep reversal points: swath generation decides what gets painted, so
+    // filtering here would reintroduce the straight-line jump across a corner.
     _jobPath = implementCenterPathFromGps(
-      forward,
+      _gpsRecordPath,
       gpsBehindM: _gpsToPivotM(),
       gpsLateralM: _gpsLateralM(),
       hitchToAxleM: _hitchToAxleM(),
@@ -2803,9 +2966,21 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (_lastSpeedSampleBucket == bucket) return;
     final dt =
         p.timestamp.difference(_lastSpeedFixTime!).inMilliseconds / 1000.0;
-    if (dt > 0 && dt < 20) {
-      _speedDistanceM += p.speedMps! * dt;
-      _lastSpeedSampleBucket = bucket;
+    if (dt <= 0 || dt >= 20) return;
+    _lastSpeedSampleBucket = bucket;
+
+    final speedMps = p.speedMps!;
+    // Drop GPS speed spikes outright — one bogus 60 km/h fix would otherwise
+    // add real metres to the job total.
+    if (speedMps > _workingSpeedMaxKph / 3.6) return;
+
+    _speedDistanceM += speedMps * dt;
+
+    // Working average: only time spent actually moving counts, so a stop inflates
+    // nothing and the working speed stays representative of the pass.
+    if (speedMps >= _workingSpeedMinKph / 3.6) {
+      _movingDistanceM += speedMps * dt;
+      _movingTimeS += dt;
     }
   }
 
@@ -3439,8 +3614,17 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (prev != null) {
       segM = distanceMetersBetween(prev, gps);
       if (segM < _minGpsRecordM) return;
+      // Only reject *jitter* backwards here. A real reversal covers distance and
+      // must be recorded, otherwise the track jumps straight across the reversed
+      // section and swath gets painted over ground that was never worked.
+      // Swath generation suppresses the reversing leg separately.
       if (_gpsRecordPath.length >= 2 &&
-          isBackwardGpsStep(prev, _gpsRecordPath[_gpsRecordPath.length - 2], gps)) {
+          segM < _reverseJitterMaxM &&
+          isBackwardGpsStep(
+            prev,
+            _gpsRecordPath[_gpsRecordPath.length - 2],
+            gps,
+          )) {
         return;
       }
       if (segM > _maxGpsJumpM) {
@@ -4235,6 +4419,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _jobPath = [];
       _lastTravelBearingDeg = null;
       _speedDistanceM = 0.0;
+    _movingDistanceM = 0.0;
+    _movingTimeS = 0.0;
       _lastSpeedFixTime = null;
       if (_currentPos != null) {
         _gpsRecordPath.add(_currentPos!);
@@ -4439,6 +4625,44 @@ _coverageDistanceCacheM = 0.0;
     final b = _dispPos!;
     setState(() => _pointB = b);
     _buildGuidance(_pointA!, b);
+  }
+
+  /// Clears A/B and the generated parallel lines so the operator can re-pick the
+  /// line mid-job. Confirmed first, because it stops active guidance.
+  Future<void> _confirmClearGuidance() async {
+    if (!_navMode || _pointA == null) return;
+
+    final bool? confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Remove guidance lines?'),
+        content: const Text(
+          'The A and B points will be cleared and guidance will stop. '
+          'You can set a new A, then B, straight away.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('Remove'),
+          ),
+        ],
+      ),
+    );
+    if (confirmed != true || !mounted) return;
+
+    setState(() {
+      _pointA = null;
+      _pointB = null;
+      _navLinesNotifier.value = [];
+      _guidanceParallelLines = [];
+      _activeLineIndex = 0;
+      _lookAheadNotifier.value = null;
+      _signedErrorNotifier.value = 0;
+    });
   }
 
   // ---------- UI: Drawer ----------
@@ -6646,6 +6870,20 @@ _coverageDistanceCacheM = 0.0;
               child: _fatRoundActionButton(
                 letter: 'B',
                 onPressed: _markB,
+              ),
+            ),
+          // Once B is set the B button is replaced by "remove guidance", so a bad
+          // or late A/B pick can be redone mid-job.
+          if (_navMode && _pointA != null && _pointB != null)
+            Positioned(
+              right: _fabEdge,
+              bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
+              child: _fatRoundActionButton(
+                glyph: _GuidanceRemoveGlyph(
+                  color: _fabContent,
+                  size: _fabDiameter * 0.54,
+                ),
+                onPressed: _confirmClearGuidance,
               ),
             ),
 
