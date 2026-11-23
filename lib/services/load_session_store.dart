@@ -256,6 +256,34 @@ class LoadSessionStore {
     return out;
   }
 
+  /// Drops [jobId] from every session (open and closed) and persists.
+  /// Returns the number of sessions changed.
+  static Future<int> removeJobEverywhere(String jobId) async {
+    if (jobId.isEmpty) return 0;
+    final path = await _filePath();
+    if (!await io.File(path).exists()) return 0;
+
+    final root = await _readRoot();
+    final raw = root['sessions'];
+    if (raw is! List) return 0;
+
+    final sessions = List<dynamic>.from(raw);
+    var changed = 0;
+    for (var i = 0; i < sessions.length; i++) {
+      final e = sessions[i];
+      if (e is! Map) continue;
+      final session = LoadSession.fromJson(e.cast<String, dynamic>());
+      if (!session.jobs.any((j) => j.jobId == jobId)) continue;
+      sessions[i] = session.withoutJob(jobId).toJson();
+      changed++;
+    }
+    if (changed == 0) return 0;
+
+    root['sessions'] = sessions;
+    await _writeRoot(root);
+    return changed;
+  }
+
   static Future<Map<String, dynamic>> exportForBackup() async {
     return await _readRoot();
   }

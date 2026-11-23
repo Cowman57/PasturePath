@@ -283,6 +283,16 @@ class LoadSession {
     applyReading(expected);
   }
 
+  /// Returns this session with [jobId] removed. No-op when it isn't present.
+  ///
+  /// Only the job reference is dropped: quantities, readings and the open/closed
+  /// state are left alone, so the remaining jobs keep their share of usage.
+  LoadSession withoutJob(String jobId) {
+    final kept = jobs.where((j) => j.jobId != jobId).toList();
+    if (kept.length == jobs.length) return this;
+    return copyWith(jobs: kept);
+  }
+
   Map<String, dynamic> toJson() => {
         'id': id,
         'unit': unit,

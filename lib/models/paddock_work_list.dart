@@ -1,21 +1,18 @@
 import 'paddock.dart';
 
-/// Planned paddocks for a spreading/spraying run, with optional target rate.
+/// Planned paddocks for a spreading/spraying run.
+///
+/// Product, unit and target rate belong to the load session (the load button),
+/// not to this list — this is only "which paddocks are still to do".
 class PaddockWorkList {
   PaddockWorkList({
     List<String>? paddockNames,
     Set<String>? completedNames,
-    this.unit = 'kg',
-    this.targetRatePerHa,
-    this.productName,
   })  : paddockNames = List<String>.from(paddockNames ?? const []),
         completedNames = Set<String>.from(completedNames ?? const {});
 
   final List<String> paddockNames;
   final Set<String> completedNames;
-  String unit;
-  double? targetRatePerHa;
-  String? productName;
 
   bool get isEmpty => paddockNames.isEmpty;
   bool get isNotEmpty => paddockNames.isNotEmpty;
@@ -23,15 +20,6 @@ class PaddockWorkList {
 
   int get completedCount =>
       paddockNames.where(completedNames.contains).length;
-
-  String get unitLabel => unit == 'L' ? 'L' : 'kg';
-  String get rateUnitLabel => '$unitLabel/ha';
-
-  String get displayName {
-    final n = productName?.trim();
-    if (n != null && n.isNotEmpty) return n;
-    return unit == 'L' ? 'Spray' : 'Product';
-  }
 
   bool contains(String name) => paddockNames.contains(name);
 
@@ -77,9 +65,6 @@ class PaddockWorkList {
   void clear() {
     paddockNames.clear();
     completedNames.clear();
-    targetRatePerHa = null;
-    productName = null;
-    unit = 'kg';
   }
 
   /// Drop names that no longer exist on the farm map.
@@ -102,13 +87,6 @@ class PaddockWorkList {
     return left < 0 ? 0 : left;
   }
 
-  /// Product still needed for unfinished paddocks at the target rate.
-  double? expectedRemainingQty(List<Paddock> paddocks) {
-    final rate = targetRatePerHa;
-    if (rate == null || rate <= 0) return null;
-    return rate * remainingHa(paddocks);
-  }
-
   static double _sumHa(List<Paddock> paddocks, Iterable<String> names) {
     final want = names.toSet();
     if (want.isEmpty) return 0;
@@ -122,10 +100,6 @@ class PaddockWorkList {
   Map<String, dynamic> toJson() => {
         'paddockNames': paddockNames,
         'completedNames': completedNames.toList()..sort(),
-        'unit': unit,
-        if (targetRatePerHa != null) 'targetRatePerHa': targetRatePerHa,
-        if (productName != null && productName!.trim().isNotEmpty)
-          'productName': productName!.trim(),
       };
 
   factory PaddockWorkList.fromJson(Map<String, dynamic> j) {
@@ -145,13 +119,11 @@ class PaddockWorkList {
         if (n.isNotEmpty) done.add(n);
       }
     }
-    final name = (j['productName'] as String?)?.trim();
+    // Lists saved by older versions carried unit/product/rate here. Those now
+    // live on the load session, so legacy keys are ignored on read.
     return PaddockWorkList(
       paddockNames: names,
       completedNames: done,
-      unit: (j['unit'] as String?) == 'L' ? 'L' : 'kg',
-      targetRatePerHa: (j['targetRatePerHa'] as num?)?.toDouble(),
-      productName: (name != null && name.isNotEmpty) ? name : null,
     );
   }
 }

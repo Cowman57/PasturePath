@@ -31,19 +31,20 @@ import '../../services/weather_service.dart';
 import '../../models/job_weather.dart';
 import '../../services/geometry.dart';
 import '../../services/geojson_parser.dart';
+import '../../services/kml_parser.dart';
 import '../../services/gps_display_smoother.dart';
 import '../../services/gps/gps_input_controller.dart';
 import '../../services/gps/gps_source.dart';
 import '../../services/implement_kinematics.dart';
 import '../../models/tool_setup_dimensions.dart';
 import '../../services/tool_preset_store.dart';
+import '../../services/update_service.dart';
 import '../../widgets/animated_popup.dart';
 import '../../widgets/navigation_arrow_icon.dart';
 import '../../widgets/work_list_sheet.dart';
 import 'tool_setup_tab.dart';
 
 import 'package:wakelock_plus/wakelock_plus.dart';
-import 'package:http/http.dart' as http;
 import 'package:package_info_plus/package_info_plus.dart';
 import 'package:url_launcher/url_launcher.dart';
 /// Paddock editor sub-state while [_MapScreenState._editorMode] is true.
@@ -943,6 +944,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     } catch (e, st) {
       debugPrint('Startup init failed: $e\n$st');
     }
+    // Best effort, once per launch — must never block the map.
+    unawaited(_maybeCheckForUpdatesOnStartup());
   }
 
   @override
@@ -1211,6 +1214,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _rebuildPaddockLayers();
     await _loadPersistedFarmJsonIfAny();
     await _refreshLoadSessionState();
+    // The work list is restored through the settings whitelist; reload it so the
+    // sheet reflects the backup immediately.
+    await _loadWorkList();
     _restoreSavedMapView();
   }
 
@@ -1277,7 +1283,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   Future<void> _onAddListPressed() async {
     if (_workListPicking) {
-      _endWorkListPicking(openSheet: _workList.targetRatePerHa == null);
+      _endWorkListPicking(openSheet: true);
       return;
     }
     _beginWorkListPicking();
@@ -1326,16 +1332,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   Future<void> _showWorkListDialog() async {
     if (!mounted) return;
-    final last = await LastLoadPrefs.load();
-    if (!mounted) return;
     final result = await showWorkListSheet(
       context: context,
       list: _workList,
       paddocks: _paddocks,
       areaText: _areaText,
-      hintProductName: last?.productName,
-      hintRate: last?.primaryRatePerHa.toStringAsFixed(0),
-      hintUnit: last?.unit,
       onRemovePaddock: (name) {
         _workList.removeName(name);
         _rebuildPaddockLayers();
@@ -1343,21 +1344,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       },
     );
     if (!mounted) return;
-    if (result == null) {
-      await _persistWorkList();
-      if (mounted) setState(() {});
-      return;
-    }
-    if (result.delete) {
+    if (result?.delete == true) {
       await _clearWorkList();
       return;
-    }
-    _workList.unit = result.unit;
-    _workList.productName = result.productName?.trim().isEmpty == true
-        ? null
-        : result.productName?.trim();
-    if (result.rate != null && result.rate! > 0) {
-      _workList.targetRatePerHa = result.rate;
     }
     await _persistWorkList();
     if (mounted) setState(() {});
@@ -1368,7 +1357,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final totalHa = _workList.totalHa(_paddocks);
     final doneHa = _workList.completedHa(_paddocks);
     final scheme = Theme.of(context).colorScheme;
-    final rate = _workList.targetRatePerHa;
     return Material(
       elevation: _fabElevation,
       color: _fabFill,
@@ -1391,15 +1379,6 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
                   color: scheme.primary,
                 ),
               ),
-              if (rate != null && rate > 0)
-                Text(
-                  '${_workList.displayName}  ${rate.toStringAsFixed(0)} ${_workList.rateUnitLabel}',
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.w600,
-                    color: scheme.onSurface.withValues(alpha: 0.75),
-                  ),
-                ),
             ],
           ),
         ),
@@ -1453,8 +1432,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
             ),
             TextButton(
               onPressed: () => _endWorkListPicking(
-                openSheet: _workList.isNotEmpty &&
-                    _workList.targetRatePerHa == null,
+                openSheet: _workList.isNotEmpty,
               ),
               child: const Text('Done'),
             ),
@@ -3961,16 +3939,38 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   // ---------- JSON load ----------
   Future<void> _loadFarmJson() async {
-    final res = await FilePicker.platform.pickFiles(type: FileType.custom, allowedExtensions: ['json']);
+    final res = await FilePicker.platform.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: const ['json', 'geojson', 'kml', 'kmz'],
+      dialogTitle: 'Select a farm map (GeoJSON or KML)',
+    );
     if (res == null || res.files.isEmpty) return;
     final f = res.files.first;
-    final bytes = f.bytes ?? (f.path != null ? await io.File(f.path!).readAsBytes() : null);
-    if (bytes == null) return;
+    final raw = f.bytes ?? (f.path != null ? await io.File(f.path!).readAsBytes() : null);
+    if (raw == null) return;
+
+    // Google Earth exports KML/KMZ. Convert to GeoJSON first so there is one
+    // validation path and the stored farm file stays GeoJSON.
+    var bytes = raw;
+    final lowerName = f.name.toLowerCase();
+    if (lowerName.endsWith('.kml') || lowerName.endsWith('.kmz')) {
+      final kml = KmlParser.toGeoJson(raw, fileName: lowerName);
+      if (kml.error != null || kml.geoJson == null) {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(
+            content: Text('KML error: ${kml.error ?? 'could not read file'}'),
+          ),
+        );
+        return;
+      }
+      bytes = kml.geoJson!;
+    }
 
     final parsed = GeoJsonParser.parseBytes(bytes);
     if (parsed.error != null) {
       if (!mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('JSON error: ${parsed.error}')));
+      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Import error: ${parsed.error}')));
       return;
     }
 
@@ -5101,7 +5101,13 @@ _coverageDistanceCacheM = 0.0;
         ),
         const Divider(),
         const ListTile(title: Text('About', style: TextStyle(fontWeight: FontWeight.bold))),
-        _AppVersionTile(),
+        const _AppVersionTile(),
+        ListTile(
+          leading: const Icon(Icons.system_update_alt),
+          title: const Text('Check for updates'),
+          subtitle: const Text('Look for a newer release on GitHub'),
+          onTap: _checkForUpdatesNow,
+        ),
       ],
         );
       },
@@ -5114,6 +5120,170 @@ _coverageDistanceCacheM = 0.0;
 
   void _invalidateBackupsFuture() {
     _backupsFuture = null;
+  }
+
+  // ---------- App updates ----------
+
+  /// Guards the silent startup check so it runs at most once per launch.
+  static bool _startupUpdateChecked = false;
+
+  Future<void> _maybeCheckForUpdatesOnStartup() async {
+    if (_startupUpdateChecked) return;
+    _startupUpdateChecked = true;
+    try {
+      final update = await UpdateService.checkForUpdates();
+      if (update == null || !mounted) return;
+      if (await UpdateService.isSnoozed()) return;
+      if (!mounted) return;
+      await _showUpdateDialog(update);
+    } catch (e) {
+      debugPrint('Update check failed: $e');
+    }
+  }
+
+  Future<void> _checkForUpdatesNow() async {
+    final messenger = ScaffoldMessenger.of(context);
+    try {
+      final update = await UpdateService.checkForUpdates();
+      if (!mounted) return;
+      if (update == null) {
+        messenger.showSnackBar(const SnackBar(content: Text('Up to date')));
+        return;
+      }
+      messenger.showSnackBar(
+        SnackBar(content: Text('v${update.version} available')),
+      );
+      await _showUpdateDialog(update);
+    } catch (e) {
+      if (!mounted) return;
+      messenger.showSnackBar(SnackBar(content: Text('Could not check: $e')));
+    }
+  }
+
+  Future<void> _showUpdateDialog(AppUpdate update) async {
+    final notes = (update.notes ?? '').trim();
+    final sizeLabel = update.apkSizeLabel;
+    final canInstall = (update.apkUrl ?? '').isNotEmpty;
+
+    await showFadeDialog<void>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('Update available — ${update.version}'),
+        content: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 420, maxHeight: 320),
+          child: SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                if (sizeLabel != null)
+                  Padding(
+                    padding: const EdgeInsets.only(bottom: 8),
+                    child: Text(
+                      'Download size: $sizeLabel',
+                      style: const TextStyle(fontSize: 12),
+                    ),
+                  ),
+                Text(
+                  notes.isEmpty
+                      ? 'A newer version is available.'
+                      : (notes.length > 1200
+                          ? notes.substring(0, 1200)
+                          : notes),
+                  style: const TextStyle(fontSize: 13),
+                ),
+              ],
+            ),
+          ),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () {
+              Navigator.pop(ctx);
+              UpdateService.snoozeFor(const Duration(days: 1));
+            },
+            child: const Text('Later'),
+          ),
+          TextButton(
+            onPressed: () {
+              final url = update.releaseUrl;
+              if (url.isEmpty) return;
+              launchUrl(Uri.parse(url), mode: LaunchMode.externalApplication);
+            },
+            child: const Text('Release notes'),
+          ),
+          if (canInstall)
+            ElevatedButton(
+              onPressed: () {
+                Navigator.pop(ctx);
+                _downloadAndInstallUpdate(update);
+              },
+              child: const Text('Download & install'),
+            ),
+        ],
+      ),
+    );
+  }
+
+  /// Streams the APK with a modal progress dialog, then hands it to the system
+  /// installer (Android always asks the user to confirm).
+  Future<void> _downloadAndInstallUpdate(AppUpdate update) async {
+    final progress = ValueNotifier<double>(0);
+    final cancel = ValueNotifier<bool>(false);
+    var dialogOpen = true;
+
+    void closeDialog() {
+      if (!dialogOpen) return;
+      dialogOpen = false;
+      if (mounted) Navigator.of(context, rootNavigator: true).pop();
+    }
+
+    unawaited(showFadeDialog<void>(
+      context: context,
+      barrierDismissible: false,
+      builder: (ctx) => _UpdateProgressDialog(
+        progress: progress,
+        onCancel: () {
+          cancel.value = true;
+          closeDialog();
+        },
+      ),
+    ));
+
+    String? path;
+    Object? error;
+    try {
+      path = await UpdateService.downloadApk(
+        update,
+        onProgress: (p) {
+          if (cancel.value) throw const _UpdateCancelled();
+          progress.value = p;
+        },
+      );
+    } on _UpdateCancelled {
+      // User backed out — nothing to install.
+    } catch (e) {
+      error = e;
+    }
+    closeDialog();
+    if (!mounted) return;
+
+    if (error != null) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Download failed: $error')),
+      );
+      return;
+    }
+    if (path == null || cancel.value) return;
+
+    try {
+      await UpdateService.installApk(path);
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Could not start installer: $e')),
+      );
+    }
   }
 
   String _gpsQualitySubtitle() {
@@ -5290,7 +5460,19 @@ _coverageDistanceCacheM = 0.0;
                             ),
                           );
                           if (ok == true) {
-                            for (final f in _histSelected) { await JobStore.delete(f); }
+                            final idByPath = {for (final r in rows) r.filePath: r.id};
+                            final deletedIds = <String>[];
+                            for (final f in _histSelected) {
+                              final id = idByPath[f];
+                              if (id != null && id.isNotEmpty) deletedIds.add(id);
+                              await JobStore.delete(f);
+                            }
+                            // Drop the deleted jobs from load sessions so the
+                            // survivors keep the right share of used product.
+                            for (final id in deletedIds) {
+                              await LoadSessionStore.removeJobEverywhere(id);
+                            }
+                            await _refreshLoadSessionState();
                             if (!context.mounted) return;
                             setState(() {
                               _histSelecting = false;
@@ -7708,153 +7890,73 @@ class _CacheMapDialogState extends State<_CacheMapDialog> {
   }
 }
 
-class _AppVersionTile extends StatefulWidget {
-  @override
-  State<_AppVersionTile> createState() => _AppVersionTileState();
-}
-
-class _AppVersionTileState extends State<_AppVersionTile> {
-  String? _latestVersion;
-  bool _loading = true;
-  String? _error;
-  static const _repoUrl = 'https://github.com/Cowman57/PasturePath';
-  static const _releasesUrl = '$_repoUrl/releases';
-  static const _apiUrl = '$_repoUrl/releases/latest';
-
-  @override
-  void initState() {
-    super.initState();
-    _checkUpdate();
-  }
-
-  Future<void> _checkUpdate() async {
-    try {
-      final uri = Uri.parse(_apiUrl);
-      final resp = await http.get(uri, headers: {'Accept': 'application/json'});
-      if (resp.statusCode != 200) {
-        if (mounted) setState(() { _loading = false; _error = 'Check failed (${resp.statusCode})'; });
-        return;
-      }
-      final data = json.decode(resp.body) as Map;
-      final tag = data['tag_name'] as String?;
-      if (tag == null || tag.isEmpty) {
-        if (mounted) setState(() { _loading = false; _error = 'No version tag'; });
-        return;
-      }
-      if (mounted) setState(() { _latestVersion = tag; _loading = false; });
-    } catch (e) {
-      if (mounted) setState(() { _loading = false; _error = e.toString(); });
-    }
-  }
+/// Shows the installed version. Update checks live on the
+/// 'Check for updates' tile below it.
+class _AppVersionTile extends StatelessWidget {
+  const _AppVersionTile();
 
   @override
   Widget build(BuildContext context) {
     return FutureBuilder<PackageInfo>(
       future: PackageInfo.fromPlatform(),
       builder: (context, snap) {
-        final version = snap.data?.version ?? '—';
-        final buildNumber = snap.data?.buildNumber ?? '—';
-        final currentVersion = 'v$version+$buildNumber';
-        final currentTag = 'v$version';
-
-        String subtitle = currentVersion; // Default
-        Widget? trailing;
-        Color? titleColor;
-        IconData? icon = Icons.info;
-
-        if (_loading) {
-          subtitle = 'Checking for updates…';
-          icon = Icons.refresh;
-        } else if (_error != null) {
-          subtitle = 'Error: $_error';
-          icon = Icons.error_outline;
-          trailing = IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _checkUpdate,
-            tooltip: 'Retry',
-          );
-        } else if (_latestVersion != null && _latestVersion!.isNotEmpty) {
-          final latest = _latestVersion!.trim();
-          final current = currentTag.trim();
-          // Compare ignoring 'v' prefix
-          final latestClean = latest.startsWith('v') ? latest.substring(1) : latest;
-          final currentClean = current.startsWith('v') ? current.substring(1) : current;
-          
-          if (latestClean != currentClean) {
-            subtitle = '$currentVersion → $latest available';
-            icon = Icons.new_releases;
-            titleColor = Theme.of(context).colorScheme.primary;
-            trailing = ElevatedButton(
-              onPressed: () => launchUrl(Uri.parse(_releasesUrl), mode: LaunchMode.externalApplication),
-              child: const Text('Update'),
-            );
-          } else {
-            subtitle = '$currentVersion (up to date)';
-            icon = Icons.check_circle;
-            trailing = IconButton(
-              icon: const Icon(Icons.refresh),
-              onPressed: _checkUpdate,
-              tooltip: 'Check for updates',
-            );
-          }
-        } else {
-          // _latestVersion is null or empty
-          subtitle = currentVersion;
-          icon = Icons.check_circle;
-          trailing = IconButton(
-            icon: const Icon(Icons.refresh),
-            onPressed: _checkUpdate,
-            tooltip: 'Check for updates',
-          );
-        }
-
-        return GestureDetector(
-          onTap: _loading ? null : _checkUpdate,
-          child: Container(
-            padding: const EdgeInsets.fromLTRB(16, 12, 16, 12),
-            child: Row(
-              children: [
-                Padding(
-                  padding: const EdgeInsets.only(right: 16),
-                  child: Icon(icon, color: titleColor, size: 24),
-                ),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        'PasturePath',
-                        style: TextStyle(
-                          fontWeight: FontWeight.normal,
-                          fontSize: 16,
-                          color: titleColor,
-                        ),
-                        overflow: TextOverflow.ellipsis,
-                        maxLines: 1,
-                      ),
-                      const SizedBox(height: 2),
-                      Text(
-                        subtitle,
-                        style: TextStyle(
-                          fontSize: 14,
-                          color: Colors.grey.shade700,
-                        ),
-                        maxLines: 2,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                    ],
-                  ),
-                ),
-                if (trailing != null)
-                  Padding(
-                    padding: const EdgeInsets.only(left: 12),
-                    child: trailing,
-                  ),
-              ],
-            ),
-          ),
+        final version = snap.data?.version;
+        final build = snap.data?.buildNumber;
+        final label = (version == null || version.isEmpty)
+            ? 'Version —'
+            : (build == null || build.isEmpty
+                ? 'Version $version'
+                : 'Version $version ($build)');
+        return ListTile(
+          leading: const Icon(Icons.info_outline),
+          title: const Text('PasturePath'),
+          subtitle: Text(label),
         );
       },
     );
   }
 }
+
+/// Modal progress for an update download, with a cancel button.
+class _UpdateProgressDialog extends StatelessWidget {
+  const _UpdateProgressDialog({
+    required this.progress,
+    required this.onCancel,
+  });
+
+  final ValueNotifier<double> progress;
+  final VoidCallback onCancel;
+
+  @override
+  Widget build(BuildContext context) {
+    return PopScope(
+      canPop: false,
+      child: AlertDialog(
+        title: const Text('Downloading update'),
+        content: ValueListenableBuilder<double>(
+          valueListenable: progress,
+          builder: (context, value, _) => Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              LinearProgressIndicator(
+                value: value <= 0 ? null : value.clamp(0.0, 1.0),
+              ),
+              const SizedBox(height: 12),
+              Text('${(value * 100).clamp(0, 100).toStringAsFixed(0)}%'),
+            ],
+          ),
+        ),
+        actions: [
+          TextButton(onPressed: onCancel, child: const Text('Cancel')),
+        ],
+      ),
+    );
+  }
+}
+
+/// Thrown from [UpdateService.downloadApk]'s progress callback to abort.
+class _UpdateCancelled implements Exception {
+  const _UpdateCancelled();
+}
+

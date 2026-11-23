@@ -59,6 +59,8 @@ class BackupStore {
     'gpsBaudRate',
     'gpsPreferredVid',
     'gpsPreferredPid',
+    // Stored as a JSON string in shared prefs rather than a scalar setting.
+    'paddockWorkList',
   ];
 
   static Future<String> backupsDir() async {
@@ -95,6 +97,17 @@ class BackupStore {
     String? farmJsonText,
   }) async {
     final now = DateTime.now();
+
+    // The paddock work list lives in shared prefs, not in the settings map the
+    // UI builds, so fold it in here. Restore writes it back via _settingsKeys.
+    final prefs = await SharedPreferences.getInstance();
+    final workList = prefs.getString('paddockWorkList');
+    final mergedSettings = <String, dynamic>{
+      ...settings,
+      if (workList != null && workList.isNotEmpty)
+        'paddockWorkList': workList,
+    };
+
     final jobs = <Map<String, dynamic>>[];
     for (final path in await JobStore.listJobFiles()) {
       final base = path.split('/').last.split('\\').last;
@@ -109,7 +122,7 @@ class BackupStore {
       'format': _format,
       'version': _version,
       'createdAt': now.toIso8601String(),
-      'settings': settings,
+      'settings': mergedSettings,
       if (farmJsonText != null) 'farmJson': farmJsonText,
       'jobs': jobs,
       'loadSessions': await LoadSessionStore.exportForBackup(),

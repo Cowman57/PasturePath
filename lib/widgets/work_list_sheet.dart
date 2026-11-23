@@ -4,18 +4,14 @@ import '../models/paddock.dart';
 import '../models/paddock_work_list.dart';
 import 'animated_popup.dart';
 
+/// Result of the paddock-list sheet.
+///
+/// Product and rate are handled by the load button, so the only decision here
+/// is whether the list itself should be deleted.
 class WorkListSheetResult {
-  const WorkListSheetResult({
-    required this.delete,
-    required this.unit,
-    this.productName,
-    this.rate,
-  });
+  const WorkListSheetResult({required this.delete});
 
   final bool delete;
-  final String unit;
-  final String? productName;
-  final double? rate;
 }
 
 Future<WorkListSheetResult?> showWorkListSheet({
@@ -24,9 +20,6 @@ Future<WorkListSheetResult?> showWorkListSheet({
   required List<Paddock> paddocks,
   required String Function(double ha) areaText,
   required void Function(String name) onRemovePaddock,
-  String? hintProductName,
-  String? hintRate,
-  String? hintUnit,
 }) {
   return showFadeModalBottomSheet<WorkListSheetResult>(
     context: context,
@@ -37,9 +30,6 @@ Future<WorkListSheetResult?> showWorkListSheet({
       paddocks: paddocks,
       areaText: areaText,
       onRemovePaddock: onRemovePaddock,
-      hintProductName: hintProductName,
-      hintRate: hintRate,
-      hintUnit: hintUnit,
     ),
   );
 }
@@ -50,71 +40,23 @@ class _WorkListSheet extends StatefulWidget {
     required this.paddocks,
     required this.areaText,
     required this.onRemovePaddock,
-    this.hintProductName,
-    this.hintRate,
-    this.hintUnit,
   });
 
   final PaddockWorkList list;
   final List<Paddock> paddocks;
   final String Function(double ha) areaText;
   final void Function(String name) onRemovePaddock;
-  final String? hintProductName;
-  final String? hintRate;
-  final String? hintUnit;
 
   @override
   State<_WorkListSheet> createState() => _WorkListSheetState();
 }
 
 class _WorkListSheetState extends State<_WorkListSheet> {
-  late final TextEditingController _nameCtrl;
-  late final TextEditingController _rateCtrl;
-  late String _unit;
-
-  @override
-  void initState() {
-    super.initState();
-    final existingName = widget.list.productName?.trim();
-    _nameCtrl = TextEditingController(
-      text: (existingName != null && existingName.isNotEmpty)
-          ? existingName
-          : '',
-    );
-    final rate = widget.list.targetRatePerHa;
-    _rateCtrl = TextEditingController(
-      text: rate != null
-          ? rate.toStringAsFixed(0)
-          : (widget.hintRate ?? ''),
-    );
-    _unit = rate != null
-        ? widget.list.unit
-        : (widget.hintUnit ?? widget.list.unit);
-  }
-
-  @override
-  void dispose() {
-    _nameCtrl.dispose();
-    _rateCtrl.dispose();
-    super.dispose();
-  }
-
   Paddock? _paddockNamed(String name) {
     for (final p in widget.paddocks) {
       if (p.name == name) return p;
     }
     return null;
-  }
-
-  WorkListSheetResult _result({required bool delete}) {
-    final name = _nameCtrl.text.trim();
-    final rate = double.tryParse(_rateCtrl.text.trim());
-    return WorkListSheetResult(
-      delete: delete,
-      unit: _unit,
-      productName: name.isEmpty ? null : name,
-      rate: (rate != null && rate > 0) ? rate : widget.list.targetRatePerHa,
-    );
   }
 
   @override
@@ -123,10 +65,6 @@ class _WorkListSheetState extends State<_WorkListSheet> {
     final totalHa = list.totalHa(widget.paddocks);
     final doneHa = list.completedHa(widget.paddocks);
     final remainHa = list.remainingHa(widget.paddocks);
-    final typedRate =
-        double.tryParse(_rateCtrl.text.trim()) ?? list.targetRatePerHa;
-    final expect =
-        (typedRate != null && typedRate > 0) ? typedRate * remainHa : null;
     final scheme = Theme.of(context).colorScheme;
 
     return Padding(
@@ -135,7 +73,7 @@ class _WorkListSheetState extends State<_WorkListSheet> {
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           Text(
-            'Paddock list',
+            'Paddocks to do',
             style: TextStyle(
               fontWeight: FontWeight.w700,
               fontSize: 18,
@@ -151,45 +89,17 @@ class _WorkListSheetState extends State<_WorkListSheet> {
               color: scheme.onSurfaceVariant,
             ),
           ),
-          const SizedBox(height: 12),
-          SegmentedButton<String>(
-            segments: const [
-              ButtonSegment(value: 'kg', label: Text('kg')),
-              ButtonSegment(value: 'L', label: Text('L')),
-            ],
-            selected: {_unit},
-            onSelectionChanged: (s) => setState(() => _unit = s.first),
-          ),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _nameCtrl,
-            textCapitalization: TextCapitalization.words,
-            decoration: InputDecoration(
-              labelText: 'Product name',
-              hintText: widget.hintProductName ?? 'eg. Urea',
-            ),
-          ),
-          const SizedBox(height: 8),
-          TextField(
-            controller: _rateCtrl,
-            keyboardType: const TextInputType.numberWithOptions(decimal: true),
-            onChanged: (_) => setState(() {}),
-            decoration: InputDecoration(
-              labelText: _unit == 'L'
-                  ? 'Target rate (L/ha)'
-                  : 'Target rate (kg/ha)',
-              hintText: widget.hintRate ?? 'eg. 80',
-            ),
-          ),
-          if (expect != null) ...[
-            const SizedBox(height: 8),
+          if (remainHa > 0) ...[
+            const SizedBox(height: 2),
             Text(
-              'Expect ${expect.toStringAsFixed(0)} $_unit remaining'
-              ' · ${widget.areaText(remainHa)} left',
-              style: TextStyle(fontSize: 13, color: scheme.onSurfaceVariant),
+              '${widget.areaText(remainHa)} still to do',
+              style: TextStyle(
+                fontSize: 13,
+                color: scheme.onSurfaceVariant,
+              ),
             ),
           ],
-          const SizedBox(height: 8),
+          const SizedBox(height: 12),
           Expanded(
             child: list.paddockNames.isEmpty
                 ? const Align(
@@ -235,20 +145,19 @@ class _WorkListSheetState extends State<_WorkListSheet> {
           Row(
             children: [
               TextButton(
-                onPressed: () =>
-                    Navigator.pop(context, _result(delete: true)),
+                onPressed: () => Navigator.pop(
+                  context,
+                  const WorkListSheetResult(delete: true),
+                ),
                 child: const Text('Delete list'),
               ),
               const Spacer(),
-              TextButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Cancel'),
-              ),
-              const SizedBox(width: 8),
               FilledButton(
-                onPressed: () =>
-                    Navigator.pop(context, _result(delete: false)),
-                child: const Text('Save'),
+                onPressed: () => Navigator.pop(
+                  context,
+                  const WorkListSheetResult(delete: false),
+                ),
+                child: const Text('Close'),
               ),
             ],
           ),
