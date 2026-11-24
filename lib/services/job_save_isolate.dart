@@ -82,6 +82,8 @@ Map<String, dynamic> _summaryMapFromJobJson(Map<String, dynamic> j) {
     'paddockNames': j['paddockNames'],
     'totalHa': j['totalHa'],
     'avgSpeedKph': j['avgSpeedKph'],
+    if (j['avgWorkingSpeedKph'] != null)
+      'avgWorkingSpeedKph': j['avgWorkingSpeedKph'],
     'swathWidthM': j['swathWidthM'],
     'pathDistanceM': pathDist,
     'swathWidthSetting': j['swathWidthSetting'],

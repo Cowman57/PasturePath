@@ -11,6 +11,8 @@ class JobFileSummary {
   final List<String> paddockNames;
   final double totalHa;
   final double avgSpeedKph;
+  /// Distance ÷ moving time (stops excluded); null when not recorded.
+  final double? avgWorkingSpeedKph;
   final double? swathWidthM;
   final double pathDistanceM;
   final double? swathWidthSetting;
@@ -26,6 +28,7 @@ class JobFileSummary {
     required this.paddockNames,
     required this.totalHa,
     required this.avgSpeedKph,
+    this.avgWorkingSpeedKph,
     this.swathWidthM,
     this.pathDistanceM = 0,
     this.swathWidthSetting,
@@ -43,6 +46,7 @@ class JobFileSummary {
       paddockNames: List<String>.from(job.paddockNames),
       totalHa: job.totalHa,
       avgSpeedKph: job.avgSpeedKph,
+      avgWorkingSpeedKph: job.avgWorkingSpeedKph,
       swathWidthM: job.swathWidthM,
       pathDistanceM: job.effectiveAppliedDistanceM,
       swathWidthSetting: job.swathWidthSetting,
@@ -80,6 +84,7 @@ class JobFileSummary {
       paddockNames: (j['paddockNames'] as List).map((e) => e.toString()).toList(),
       totalHa: (j['totalHa'] as num).toDouble(),
       avgSpeedKph: (j['avgSpeedKph'] as num).toDouble(),
+      avgWorkingSpeedKph: (j['avgWorkingSpeedKph'] as num?)?.toDouble(),
       swathWidthM: (j['swathWidthM'] as num?)?.toDouble(),
       pathDistanceM: pathDist,
       swathWidthSetting: (j['swathWidthSetting'] as num?)?.toDouble(),
@@ -98,6 +103,7 @@ class JobFileSummary {
     'paddockNames': paddockNames,
     'totalHa': totalHa,
     'avgSpeedKph': avgSpeedKph,
+    if (avgWorkingSpeedKph != null) 'avgWorkingSpeedKph': avgWorkingSpeedKph,
     'swathWidthM': swathWidthM,
     'pathDistanceM': pathDistanceM,
     'swathWidthSetting': swathWidthSetting,
@@ -142,6 +148,7 @@ class SavedJob {
   final List<String> paddockNames; // names saved for readability
   final double totalHa;
   final double avgSpeedKph;        // average speed across the job
+  final double? avgWorkingSpeedKph; // distance ÷ moving time, excluding stops (null if not stored)
   final double? swathWidthM;       // implement width in metres at job finish (null if not stored)
   final double pathDistanceM;      // applied path length (where swath was recorded)
   final double? swathWidthSetting; // width value in user units at job finish
@@ -158,6 +165,7 @@ class SavedJob {
     required this.paddockNames,
     required this.totalHa,
     required this.avgSpeedKph,
+    this.avgWorkingSpeedKph,
     this.swathWidthM,
     this.pathDistanceM = 0,
     this.swathWidthSetting,
@@ -175,6 +183,7 @@ class SavedJob {
         paddockNames: paddockNames,
         totalHa: totalHa,
         avgSpeedKph: avgSpeedKph,
+        avgWorkingSpeedKph: avgWorkingSpeedKph,
         swathWidthM: swathWidthM,
         pathDistanceM: pathDistanceM,
         swathWidthSetting: swathWidthSetting,
@@ -235,6 +244,7 @@ class SavedJob {
     'paddockNames': paddockNames,
     'totalHa': totalHa,
     'avgSpeedKph': avgSpeedKph,
+    if (avgWorkingSpeedKph != null) 'avgWorkingSpeedKph': avgWorkingSpeedKph,
     'swathWidthM': swathWidthM,
     'pathDistanceM': pathDistanceM,
     'swathWidthSetting': swathWidthSetting,
@@ -273,6 +283,7 @@ class SavedJob {
       paddockNames: (j['paddockNames'] as List).map((e) => e.toString()).toList(),
       totalHa: (j['totalHa'] as num).toDouble(),
       avgSpeedKph: (j['avgSpeedKph'] as num).toDouble(),
+      avgWorkingSpeedKph: (j['avgWorkingSpeedKph'] as num?)?.toDouble(),
       swathWidthM: (j['swathWidthM'] as num?)?.toDouble(),
       pathDistanceM: pathDist,
       swathWidthSetting: (j['swathWidthSetting'] as num?)?.toDouble(),

@@ -245,6 +245,8 @@ class JobStore {
           'endedAt': job.endedAt.toIso8601String(),
           'totalHa': job.totalHa,
           'avgSpeedKph': job.avgSpeedKph,
+          if (job.avgWorkingSpeedKph != null)
+            'avgWorkingSpeedKph': job.avgWorkingSpeedKph,
           'paddocks': job.paddockNames,
         },
         'geometry': {

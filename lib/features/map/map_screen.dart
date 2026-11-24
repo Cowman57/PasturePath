@@ -32,6 +32,7 @@ import '../../models/job_weather.dart';
 import '../../services/geometry.dart';
 import '../../services/geojson_parser.dart';
 import '../../services/kml_parser.dart';
+import '../../services/farm_map_exporter.dart';
 import '../../services/gps_display_smoother.dart';
 import '../../services/gps/gps_input_controller.dart';
 import '../../services/gps/gps_source.dart';
@@ -208,6 +209,52 @@ class _GuidanceRemoveGlyphPainter extends CustomPainter {
 }
 
 /// Sizes the remove-guidance glyph to a round action button.
+/// Name prompt that owns its own text controller. Disposing a controller
+/// straight after a dialog closes races the route's exit animation and throws
+/// "A TextEditingController was used after being disposed".
+class _PaddockNameDialog extends StatefulWidget {
+  const _PaddockNameDialog();
+
+  @override
+  State<_PaddockNameDialog> createState() => _PaddockNameDialogState();
+}
+
+class _PaddockNameDialogState extends State<_PaddockNameDialog> {
+  final TextEditingController _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _submit() {
+    Navigator.pop(context, _controller.text.trim());
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return AlertDialog(
+      title: const Text('Paddock name'),
+      content: TextField(
+        controller: _controller,
+        autofocus: true,
+        textCapitalization: TextCapitalization.words,
+        textInputAction: TextInputAction.done,
+        onSubmitted: (_) => _submit(),
+        decoration: const InputDecoration(hintText: 'eg. North 01'),
+      ),
+      actions: [
+        TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('Cancel'),
+        ),
+        TextButton(onPressed: _submit, child: const Text('Save')),
+      ],
+    );
+  }
+}
+
 class _GuidanceRemoveGlyph extends StatelessWidget {
   const _GuidanceRemoveGlyph({required this.color, required this.size});
 
@@ -505,8 +552,30 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   }
 
   /// Done: edit/draw → browse; selecting → cancel select; browse → exit editor.
-  void _editorDone() {
+  Future<void> _editorDone() async {
     if (!_editorMode) return;
+    final drawing = (_tool == EditorTool.drawOuter && _tempOuter.isNotEmpty) ||
+        (_tool == EditorTool.drawHole && _tempHole.isNotEmpty);
+    if (drawing) {
+      final discard = await showFadeDialog<bool>(
+        context: context,
+        builder: (ctx) => AlertDialog(
+          title: const Text('Discard drawing?'),
+          content: const Text('The points you have placed will be lost.'),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(ctx, false),
+              child: const Text('Keep drawing'),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(ctx, true),
+              child: const Text('Discard'),
+            ),
+          ],
+        ),
+      );
+      if (discard != true || !mounted) return;
+    }
     if (_editorSelecting) {
       setState(() {
         _editorSelecting = false;
@@ -611,11 +680,23 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       ),
     );
     if (ok != true || !mounted) return;
+    await _deletePaddocksAt(_selectedIdx.toSet());
+  }
 
-    final remove = _selectedIdx.toList()..sort((a, b) => b.compareTo(a));
+  /// Deletes [indices] once confirmation has already been given.
+  Future<void> _deletePaddocksAt(Set<int> indices) async {
+    final valid = indices
+        .where((i) => i >= 0 && i < _paddocks.length)
+        .toList()
+      ..sort();
+    if (valid.isEmpty) return;
+    final names = valid.map((i) => _paddocks[i].name).toList()..sort();
+    final count = valid.length;
+
+    final remove = valid.reversed.toList();
     setState(() {
       for (final i in remove) {
-        if (i >= 0 && i < _paddocks.length) _paddocks.removeAt(i);
+        _paddocks.removeAt(i);
       }
       _selectedIdx.clear();
       _editorSelecting = false;
@@ -639,6 +720,44 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  /// Deletes the paddock currently open in the editor (single confirmation).
+  Future<void> _deleteEditingPaddock() async {
+    final idx = _editingIdx;
+    if (idx == null || idx < 0 || idx >= _paddocks.length || !mounted) return;
+    final name = _paddocks[idx].name;
+    final ok = await showFadeDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: const Text('Delete paddock?'),
+        content: Text(
+          'Delete “$name” permanently from the farm map? '
+          'This cannot be undone.',
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: const Text('Cancel'),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: const Text('Delete'),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    await _deletePaddocksAt({idx});
+    if (!mounted) return;
+    setState(() {
+      _editorMode = false;
+      _tool = EditorTool.browse;
+      _editingIdx = null;
+      _clearVertexSelection();
+      _draftPaddockName = null;
+    });
+    _rebuildPaddockLayers();
   }
 
   Future<void> _startNewPaddock() async {
@@ -667,6 +786,15 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _tempHole.clear();
       _clearVertexSelection();
     });
+  }
+
+  /// Shortcut from the selected paddock straight into the editor.
+  void _editSelectedPaddock() {
+    final idx = _selectedIdx.isEmpty ? null : _selectedIdx.first;
+    _enterEditorMode();
+    if (idx == null || !mounted) return;
+    if (idx < 0 || idx >= _paddocks.length) return;
+    _selectPaddockForEdit(idx);
   }
 
   void _selectPaddockForEdit(int idx) {
@@ -722,10 +850,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
     final target = ring[vertexIdx];
     _swoopCamera(center: target);
+    // Do NOT snap here. The swoop is animated, so one frame in the camera is
+    // still near where it started — snapping would yank the vertex to the old
+    // view centre, making the tapped point vanish and distorting the ring. The
+    // vertex already sits where it was tapped; the crosshair becomes its handle
+    // once the user pans.
     _runAfterMapFrame(() {
       if (!mounted) return;
       _suppressVertexLiveMove = false;
-      _snapSelectedVertexToCenter(persist: false);
     });
   }
 
@@ -780,6 +912,41 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _persistFarmJson(_buildFarmGeoJsonBytes());
       _selectVertex(holeIdx: holeIdx, vertexIdx: insertAt);
     }
+  }
+
+  /// Splits the edge before/after the grabbed vertex at [at] and selects the new
+  /// point. [at] is where the "+" handle was tapped, so the point lands exactly
+  /// where the operator aimed.
+  void _insertVertexOnAdjacentEdge({
+    required bool before,
+    required LatLng at,
+  }) {
+    if (!_editorMode || _tool != EditorTool.edit) return;
+    final idx = _editingIdx;
+    final selected = _selectedVertexIdx;
+    if (idx == null || selected == null) return;
+    final ring = _selectedRing();
+    if (ring == null || ring.length < 2) return;
+
+    final updated = insertVertexAdjacentTo(
+      ring,
+      selected,
+      before: before,
+      point: at,
+    );
+    if (updated.length == ring.length) return;
+
+    setState(() {
+      ring
+        ..clear()
+        ..addAll(updated);
+    });
+    _recalcPaddock(idx);
+    _persistFarmJson(_buildFarmGeoJsonBytes());
+    _selectVertex(
+      holeIdx: _selectedHoleIdx,
+      vertexIdx: before ? selected : selected + 1,
+    );
   }
 
   void _deleteSelectedVertex() {
@@ -1602,6 +1769,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     rateCtrl.dispose();
     productKgCtrl.dispose();
     if (ok != true || !mounted) return;
+    FocusScope.of(context).unfocus();
 
     String? pickStr(TextEditingController c, String? hint) {
       final t = c.text.trim();
@@ -1793,6 +1961,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       return;
     }
     if (action != 'record' && action != 'end') return;
+    FocusScope.of(context).unfocus();
     final reading = double.tryParse(readingCtrl.text.trim());
     if (reading == null || reading < 0) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -1863,14 +2032,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (actual <= 0 || target <= 0) return;
 
     // Scale from the WORKING speed, not the elapsed-time average: stops must not
-    // pull the suggestion down. Saved jobs don't carry moving time yet, so no
-    // recommendation is offered for them rather than a misleading one.
-    if (_completedJobSummary != null) {
-      if (!mounted) return;
-      setState(() => _suggestedTargetSpeedKph = null);
-      return;
-    }
-    final avgSpeed = _navLiveWorkingSpeedKph();
+    // pull the suggestion down. Prefer the saved working speed so the summary
+    // still gets a recommendation once the job is finished.
+    final avgSpeed =
+        _completedJobSummary?.avgWorkingSpeedKph ?? _navLiveWorkingSpeedKph();
     if (avgSpeed <= 0) return;
 
     final coverage = _completedJobSummary != null
@@ -2708,9 +2873,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         title = 'Editing: $name';
         if (_vertexLiveMove && _selectedVertexIdx != null) {
           final where = _selectedHoleIdx == null ? 'outer' : 'hole';
-          subtitle = 'Dragging $where vertex — pan to move';
+          subtitle = 'Dragging $where vertex — pan to move · '
+              'tap + to add a point on an edge';
         } else {
-          subtitle = 'Tap a vertex to drag, or Add / Hole';
+          subtitle =
+              'Tap a vertex to drag · Add point · Delete paddock removes it';
         }
     }
     return Material(
@@ -2755,7 +2922,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
           children: [
             TextButton(
               onPressed: _editorDone,
-              child: const Text('Done'),
+              child: const Text('Cancel'),
             ),
             TextButton(
               onPressed: _paddocks.isEmpty
@@ -2791,9 +2958,64 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     );
   }
 
-  Widget _editorActionBar() {
-    final canDelete =
-        _tool == EditorTool.edit && _selectedVertexIdx != null;
+  /// Circular rail button matching [_jobRailChip]: a small icon with a short
+  /// label beneath it, both inside a circle the same size as the selection
+  /// rail's, so every action button on the map is the same control.
+  Widget _editorRailButton({
+    required IconData icon,
+    required String tooltip,
+    required String label,
+    required VoidCallback? onPressed,
+    bool destructive = false,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    final enabled = onPressed != null;
+    final Color contentColor = !enabled
+        ? _fabContent.withValues(alpha: 0.38)
+        : destructive
+            ? scheme.error
+            : _fabContent;
+
+    return Tooltip(
+      message: tooltip,
+      child: _floatingCircleFace(
+        diameter: _fabDiameter,
+        onTap: onPressed,
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
+          child: Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            children: [
+              Icon(icon, size: 22, color: contentColor),
+              const SizedBox(height: 4),
+              Text(
+                label,
+                textAlign: TextAlign.center,
+                maxLines: 2,
+                overflow: TextOverflow.ellipsis,
+                style: TextStyle(
+                  fontSize: 10,
+                  fontWeight: FontWeight.w800,
+                  height: 1.1,
+                  color: contentColor,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  /// Vertical tool rail on the right edge.
+  ///
+  /// Destructive actions sit at the top — furthest from the thumb — and the
+  /// most-used action is nearest the bottom.
+  Widget _editorActionRail() {
+    final canAddPoint = _tool == EditorTool.drawOuter ||
+        _tool == EditorTool.drawHole ||
+        (_tool == EditorTool.edit && _editingIdx != null);
+    final canDelete = _tool == EditorTool.edit && _selectedVertexIdx != null;
     final canDeleteHole =
         _tool == EditorTool.edit && _selectedHoleIdx != null;
     final canFinishOuter =
@@ -2803,76 +3025,72 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final canUndo = (_tool == EditorTool.drawOuter && _tempOuter.isNotEmpty) ||
         (_tool == EditorTool.drawHole && _tempHole.isNotEmpty);
 
-    Widget chip(String label, VoidCallback? onTap, {bool primary = false}) {
-      final enabled = onTap != null;
-      final scheme = Theme.of(context).colorScheme;
-      return Material(
-        color: !enabled
-            ? scheme.surfaceContainerHighest.withValues(alpha: 0.5)
-            : primary
-                ? scheme.primary
-                : scheme.surface,
-        elevation: enabled ? 2 : 0,
-        borderRadius: BorderRadius.circular(10),
-        child: InkWell(
-          onTap: onTap,
-          borderRadius: BorderRadius.circular(10),
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 12),
-            child: Text(
-              label,
-              style: TextStyle(
-                fontWeight: FontWeight.w700,
-                color: !enabled
-                    ? scheme.onSurface.withValues(alpha: 0.38)
-                    : primary
-                        ? scheme.onPrimary
-                        : scheme.primary,
-              ),
-            ),
-          ),
+    final buttons = <Widget>[
+      if (_tool == EditorTool.edit) ...[
+        _editorRailButton(
+          icon: Icons.delete_forever,
+          tooltip: 'Delete this paddock',
+          label: 'Delete\npaddock',
+          destructive: true,
+          onPressed: _editingIdx != null ? _deleteEditingPaddock : null,
         ),
-      );
-    }
+        _editorRailButton(
+          icon: Icons.do_not_disturb_on_outlined,
+          tooltip: 'Delete hole',
+          label: 'Delete\nhole',
+          destructive: true,
+          onPressed: canDeleteHole ? _deleteSelectedHole : null,
+        ),
+        _editorRailButton(
+          icon: Icons.backspace_outlined,
+          tooltip: 'Delete selected point',
+          label: 'Delete\npoint',
+          destructive: true,
+          onPressed: canDelete ? _deleteSelectedVertex : null,
+        ),
+        _editorRailButton(
+          icon: Icons.add_circle_outline,
+          tooltip: 'Add hole',
+          label: 'Add\nhole',
+          onPressed: _startDrawHole,
+        ),
+        _editorRailButton(
+          icon: Icons.add,
+          tooltip: 'Add point at crosshair',
+          label: 'Add\npoint',
+          onPressed: canAddPoint ? _addVertexAtCrosshair : null,
+        ),
+      ] else ...[
+        _editorRailButton(
+          icon: Icons.undo,
+          tooltip: 'Undo last point',
+          label: 'Undo',
+          onPressed: canUndo ? _undoLastPoint : null,
+        ),
+        _editorRailButton(
+          icon: Icons.add,
+          tooltip: 'Add point at crosshair',
+          label: 'Add\npoint',
+          onPressed: canAddPoint ? _addVertexAtCrosshair : null,
+        ),
+        _editorRailButton(
+          icon: Icons.check_circle,
+          tooltip: 'Finish shape',
+          label: 'Finish',
+          onPressed: (canFinishOuter || canFinishHole) ? _finishDrawing : null,
+        ),
+      ],
+    ];
 
-    return Material(
-      color: Theme.of(context).colorScheme.surface.withValues(alpha: 0.94),
-      elevation: 4,
-      borderRadius: BorderRadius.circular(14),
-      child: Padding(
-        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
-        child: SingleChildScrollView(
-          scrollDirection: Axis.horizontal,
-          child: Row(
-            children: [
-              chip('Add', _addVertexAtCrosshair),
-              if (_tool == EditorTool.edit) ...[
-                const SizedBox(width: 8),
-                chip('Hole', _startDrawHole),
-                const SizedBox(width: 8),
-                chip('Delete', canDelete ? _deleteSelectedVertex : null),
-                if (canDeleteHole) ...[
-                  const SizedBox(width: 8),
-                  chip('Del hole', _deleteSelectedHole),
-                ],
-              ],
-              if (_tool == EditorTool.drawOuter ||
-                  _tool == EditorTool.drawHole) ...[
-                const SizedBox(width: 8),
-                chip('Undo', canUndo ? _undoLastPoint : null),
-                const SizedBox(width: 8),
-                chip(
-                  'Finish',
-                  canFinishOuter || canFinishHole ? _finishDrawing : null,
-                  primary: true,
-                ),
-              ],
-              const SizedBox(width: 8),
-              chip('Done', _editorDone),
-            ],
-          ),
-        ),
-      ),
+    return Column(
+      mainAxisSize: MainAxisSize.min,
+      crossAxisAlignment: CrossAxisAlignment.end,
+      children: [
+        for (var i = 0; i < buttons.length; i++) ...[
+          if (i > 0) const SizedBox(height: _fabGap),
+          buttons[i],
+        ],
+      ],
     );
   }
 
@@ -3989,6 +4207,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       _clearSwathDisplay();
       _maybeAutoSelectPaddockFromGps();
     });
+    // Import ends any navigation session, so sync the wake lock too.
+    _updateWakeLock();
     _pruneWorkListToFarm();
     _rebuildPaddockLayers();
 
@@ -3997,48 +4217,71 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
   }
 
-  Future<void> _cacheFarmMapTiles() async {
-    final pts = <LatLng>[
-      for (final p in _paddocks) ...p.outer,
-    ];
-    final bounds = MapTileCache.boundsForPaddocks(pts);
-    if (bounds == null) {
-      if (!mounted) return;
+  /// Saves the paddock map to Downloads in the chosen format.
+  Future<void> _exportFarmMap() async {
+    if (_paddocks.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Load paddocks before caching map tiles')),
+        const SnackBar(content: Text('No paddocks to export')),
       );
       return;
     }
 
-    _closeEndDrawer();
-
-    // No {s} subdomains here: the cache dialog builds URLs directly.
-    final url = switch (_basemap) {
-      BasemapType.streets => _osmTileUrl,
-      BasemapType.esriSatellite => _esriTileUrl,
-      BasemapType.openAerialMap => _oamTileUrl,
-      BasemapType.linzAerial => _linzTilesWithKey,
-    };
-
-    if (!mounted) return;
-    // Run prefetch inside the dialog so it always dismisses itself when done
-    // (avoids a race where prefetch finishes before the route is pushed).
-    final result = await showFadeDialog<({int done, bool cancelled})>(
+    final format = await showFadeDialog<ExportFormat>(
       context: context,
-      barrierDismissible: false,
-      builder: (ctx) => _CacheMapDialog(bounds: bounds, urlTemplate: url),
-    );
-
-    if (!mounted || result == null) return;
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(
-        content: Text(
-          result.cancelled
-              ? 'Map cache cancelled (${result.done} tiles)'
-              : 'Cached ${result.done} map tiles for farm area',
-        ),
+      builder: (ctx) => SimpleDialog(
+        title: const Text('Export farm map'),
+        children: [
+          for (final f in FarmMapExporter.formats)
+            SimpleDialogOption(
+              onPressed: () => Navigator.pop(ctx, f),
+              child: ListTile(
+                contentPadding: EdgeInsets.zero,
+                leading: const Icon(Icons.description_outlined),
+                title: Text(f.label),
+                subtitle: Text('.${f.extension}'),
+              ),
+            ),
+        ],
       ),
     );
+    if (format == null || !mounted) return;
+
+    try {
+      final bytes = FarmMapExporter.encode(_paddocks, format);
+      final when = DateTime.now();
+      final stamp = '${when.year.toString().padLeft(4, '0')}-'
+          '${when.month.toString().padLeft(2, '0')}-'
+          '${when.day.toString().padLeft(2, '0')} '
+          '${when.hour.toString().padLeft(2, '0')}-'
+          '${when.minute.toString().padLeft(2, '0')}';
+      final name = 'PasturePath farm $stamp.${format.extension}';
+
+      bool? copied;
+      try {
+        copied = await BackupStore.saveBytesToDownloads(
+          bytes: bytes,
+          fileName: name,
+        );
+      } catch (_) {
+        copied = null;
+      }
+
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text(
+            copied == true
+                ? 'Exported to Downloads: $name'
+                : 'Exported: $name (${_paddocks.length} paddocks)',
+          ),
+        ),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Export failed: $e')),
+      );
+    }
   }
 
   // ---------- Map taps ----------
@@ -4097,6 +4340,80 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _rebuildPaddockLayers();
   }
 
+  /// Ghost "+" handles on the edges either side of the grabbed vertex.
+  ///
+  /// The operator taps the spot they want, which removes any need to explain
+  /// "before" and "after" — a direction they have no mental model for.
+  Widget _buildAddPointHandles(Paddock p) {
+    if (!_editorMode || _tool != EditorTool.edit) {
+      return const SizedBox.shrink();
+    }
+    final selected = _selectedVertexIdx;
+    if (_editingIdx == null || selected == null) {
+      return const SizedBox.shrink();
+    }
+
+    final holeIdx = _selectedHoleIdx;
+    final ring = holeIdx == null ? p.outer : p.holes[holeIdx];
+    if (ring.length < 2) return const SizedBox.shrink();
+
+    final scheme = Theme.of(context).colorScheme;
+    final markers = <Marker>[];
+
+    final anchor = ring[selected];
+    final n = ring.length;
+
+    // Offset by a fixed SCREEN distance, not the edge midpoint: when the
+    // operator zooms right in to place a point accurately, a long edge pushes
+    // its midpoint off screen. Convert ~64 px to metres at the current zoom and
+    // cap it at 60% of the edge so it never reaches the far vertex.
+    final zoom = _mapReady ? _mapController.camera.zoom : 16.0;
+    final metresPerPixel = 156543.03392804097 *
+        math.cos(anchor.latitude * math.pi / 180.0) /
+        math.pow(2, zoom);
+    final desiredM = 64.0 * metresPerPixel;
+    const distance = Distance();
+
+    for (final before in const [true, false]) {
+      final neighbour = ring[before ? (selected - 1 + n) % n : (selected + 1) % n];
+      final edgeM = distanceMetersBetween(anchor, neighbour);
+      if (edgeM <= 0.01) continue;
+
+      final step = math.min(desiredM, edgeM * 0.6);
+      final point = distance.offset(
+        anchor,
+        step,
+        distance.bearing(anchor, neighbour),
+      );
+
+      markers.add(
+        Marker(
+          point: point,
+          width: 32,
+          height: 32,
+          alignment: Alignment.center,
+          child: GestureDetector(
+            onTap: () => _insertVertexOnAdjacentEdge(before: before, at: point),
+            child: Container(
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                color: scheme.surface.withValues(alpha: 0.9),
+                border: Border.all(color: scheme.secondary, width: 2),
+                boxShadow: const [
+                  BoxShadow(color: Colors.black26, blurRadius: 3),
+                ],
+              ),
+              child: Icon(Icons.add, size: 18, color: scheme.secondary),
+            ),
+          ),
+        ),
+      );
+    }
+
+    if (markers.isEmpty) return const SizedBox.shrink();
+    return MarkerLayer(markers: markers);
+  }
+
   Widget _buildVertexMarkers(Paddock p) {
     if (!_editorMode || _tool != EditorTool.edit || _editingIdx == null) {
       return const SizedBox.shrink();
@@ -4107,6 +4424,10 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       for (var i = 0; i < ring.length; i++) {
         final isSel =
             _selectedHoleIdx == holeIdx && _selectedVertexIdx == i;
+        // While a vertex is grabbed it sits under the crosshair, so drawing the
+        // marker would hide the ground being aimed at. The highlighted crosshair
+        // is the handle until the operator lets go.
+        if (isSel && _vertexLiveMove) continue;
         markers.add(
           Marker(
             point: ring[i],
@@ -4141,19 +4462,30 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     return MarkerLayer(markers: markers);
   }
 
+  /// Asks for a paddock name.
+  ///
+  /// Names must be unique: the paddock list and job attribution are keyed by
+  /// name, so a duplicate would silently merge two paddocks' progress.
   Future<String?> _promptName(BuildContext context) async {
-    final c = TextEditingController();
-    return showFadeDialog<String>(
+    final result = await showFadeDialog<String>(
       context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Paddock name'),
-        content: TextField(controller: c, decoration: const InputDecoration(hintText: 'eg. North 01')),
-        actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('Cancel')),
-          TextButton(onPressed: () => Navigator.pop(ctx, c.text.trim()), child: const Text('Save')),
-        ],
-      ),
+      builder: (ctx) => const _PaddockNameDialog(),
     );
+    if (result == null) return null;
+
+    final name = result.trim();
+    if (name.isEmpty) return null;
+    final clash = _paddocks.any(
+      (p) => p.name.toLowerCase() == name.toLowerCase(),
+    );
+    if (clash) {
+      if (!context.mounted) return null;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('"$name" already exists — pick another name')),
+      );
+      return _promptName(context);
+    }
+    return name;
   }
 
   // Hit test which paddock contains the point (outer contains and not inside any hole)
@@ -4243,6 +4575,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     final ctrl = _completedReadingCtrl;
     final open = _openLoadSession;
     if (ctrl == null || open == null) return;
+    FocusScope.of(context).unfocus();
     final reading = double.tryParse(ctrl.text.trim());
     if (reading == null || reading < 0) {
       if (!mounted) return;
@@ -4488,6 +4821,7 @@ _coverageDistanceCacheM = 0.0;
         _lookAheadNotifier.value = null;
       });
       // Leaving nav returns to the map view the user had set before.
+      _updateWakeLock();
       _restoreSavedMapView();
       return;
     }
@@ -4556,6 +4890,7 @@ _coverageDistanceCacheM = 0.0;
         paddockNames: names,
         totalHa: totalHa,
         avgSpeedKph: avgKph,
+        avgWorkingSpeedKph: _movingTimeS > 0 ? _navLiveWorkingSpeedKph() : null,
         swathWidthM: widthM,
         pathDistanceM: pathDistanceM,
         swathWidthSetting: displayWidth,
@@ -4591,6 +4926,8 @@ _coverageDistanceCacheM = 0.0;
         _showCompletedJobOnMap(job);
         _invalidateJobSummariesCache();
       });
+      // Nav has ended: let the screen sleep again.
+      _updateWakeLock();
       _restoreSavedMapView();
     } catch (e) {
       if (mounted) {
@@ -5005,24 +5342,19 @@ _coverageDistanceCacheM = 0.0;
         const ListTile(title: Text('Farm JSON', style: TextStyle(fontWeight: FontWeight.bold))),
         ListTile(
           leading: const Icon(Icons.upload_file),
-          title: const Text('Load farm JSON'),
+          title: const Text('Import farm map'),
           subtitle: Text(
-            _paddocks.isEmpty
-                ? (_persistedJsonPath == null ? 'None loaded' : 'Loaded (persisted): ${_paddocks.length} paddocks')
-                : 'Loaded: ${_paddocks.length} paddocks',
+            'GeoJSON · JSON · KML · KMZ'
+            '${_paddocks.isEmpty ? '' : ' · loaded: ${_paddocks.length} paddocks'}',
           ),
           onTap: _loadFarmJson,
         ),
         ListTile(
-          leading: const Icon(Icons.download_for_offline_outlined),
-          title: const Text('Cache farm map'),
-          subtitle: Text(
-            _paddocks.isEmpty
-                ? 'Load paddocks first'
-                : 'Download map tiles covering ${_paddocks.length} paddocks',
-          ),
+          leading: const Icon(Icons.save_alt),
+          title: const Text('Export farm map'),
+          subtitle: const Text('GeoJSON, KML or CSV, saved to Downloads'),
           enabled: _paddocks.isNotEmpty,
-          onTap: _cacheFarmMapTiles,
+          onTap: _exportFarmMap,
         ),
 
         const Divider(),
@@ -5836,6 +6168,11 @@ _coverageDistanceCacheM = 0.0;
                   stat('Applied', _areaText(appliedHa)),
                   stat('Coverage', '${_jobCoveragePercent(j).toStringAsFixed(0)}%'),
                   stat('Avg speed', '${j.avgSpeedKph.toStringAsFixed(1)} km/h'),
+                  if (j.avgWorkingSpeedKph != null)
+                    stat(
+                      'Work speed',
+                      '${j.avgWorkingSpeedKph!.toStringAsFixed(1)} km/h',
+                    ),
                   if (_suggestedTargetSpeedKph != null)
                     stat(
                       'Target speed',
@@ -6837,6 +7174,11 @@ _coverageDistanceCacheM = 0.0;
                   _editingIdx != null)
                 _buildVertexMarkers(_paddocks[_editingIdx!]),
 
+              if (_editorMode &&
+                  _tool == EditorTool.edit &&
+                  _editingIdx != null)
+                _buildAddPointHandles(_paddocks[_editingIdx!]),
+
               // Labels above swath
               ValueListenableBuilder<List<Marker>>(
                 valueListenable: _paddockLabelsNotifier,
@@ -6880,9 +7222,13 @@ _coverageDistanceCacheM = 0.0;
 
           // Paddock editor: crosshair + chrome
           if (_editorMode) ...[
-            const IgnorePointer(
+            IgnorePointer(
               child: Center(
-                child: _EditorCrosshair(),
+                child: _EditorCrosshair(
+                  active: _tool == EditorTool.edit &&
+                      _vertexLiveMove &&
+                      _selectedVertexIdx != null,
+                ),
               ),
             ),
             Positioned(
@@ -6901,18 +7247,7 @@ _coverageDistanceCacheM = 0.0;
                   onPressed: _startNewPaddock,
                 ),
               ),
-            if (_tool == EditorTool.browse && !_editorSelecting)
-              Positioned(
-                left: _fabEdge,
-                bottom: _fabEdge + safe.bottom,
-                child: _fatRoundActionButton(
-                  icon: Icons.check,
-                  diameter: _fabSecondaryDiameter,
-                  heroTag: 'editorDoneBrowse',
-                  onPressed: _editorDone,
-                ),
-              ),
-            if (_tool == EditorTool.browse && _editorSelecting)
+              if (_tool == EditorTool.browse && _editorSelecting)
               Positioned(
                 left: _fabEdge,
                 right: _fabEdge,
@@ -6923,10 +7258,9 @@ _coverageDistanceCacheM = 0.0;
                 _tool == EditorTool.drawHole ||
                 _tool == EditorTool.edit)
               Positioned(
-                left: _fabEdge,
                 right: _fabEdge,
                 bottom: _fabEdge + safe.bottom,
-                child: _editorActionBar(),
+                child: _editorActionRail(),
               ),
           ],
 
@@ -6989,7 +7323,8 @@ _coverageDistanceCacheM = 0.0;
                   icon: Icons.close,
                   diameter: _fabSecondaryDiameter,
                   heroTag: 'editorExit',
-                  onPressed: _exitEditorMode,
+                  // Contextual: back a step (draw/edit &#8594; browse), then exit.
+                  onPressed: _editorDone,
                 ),
               ),
           ],
@@ -7090,16 +7425,29 @@ _coverageDistanceCacheM = 0.0;
             Positioned(
               left: _fabEdge,
               bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
-              child: _jobSideRail(
-                paddockLabel: _selectedIdx.length == 1
-                    ? selectedNames.first
-                    : '${_selectedIdx.length} paddocks',
-                toolLabel: _toolQuickReferenceText(),
-                areaLabel: _areaText(totalHa),
-                historyPaddockName: singleSelectedName,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  _editorRailButton(
+                    icon: Icons.edit,
+                    tooltip: 'Edit this paddock',
+                    label: 'Edit\npaddock',
+                    onPressed: _editSelectedPaddock,
+                  ),
+                  const SizedBox(height: _fabGap),
+                  _jobSideRail(
+                    paddockLabel: _selectedIdx.length == 1
+                        ? selectedNames.first
+                        : '${_selectedIdx.length} paddocks',
+                    toolLabel: _toolQuickReferenceText(),
+                    areaLabel: _areaText(totalHa),
+                    historyPaddockName: singleSelectedName,
+                  ),
+                ],
               ),
             ),
-            Positioned(
+          Positioned(
               right: _fabEdge,
               bottom: _fabEdge + MediaQuery.of(context).padding.bottom,
               child: _fatRoundActionButton(
@@ -7162,11 +7510,16 @@ _coverageDistanceCacheM = 0.0;
 
 /// Fixed screen-center crosshair for paddock vertex placement.
 class _EditorCrosshair extends StatelessWidget {
-  const _EditorCrosshair();
+  const _EditorCrosshair({this.active = false});
+
+  /// True while a vertex is grabbed and following the crosshair, so it reads as
+  /// the handle rather than decoration.
+  final bool active;
 
   @override
   Widget build(BuildContext context) {
-    final color = Theme.of(context).colorScheme.primary;
+    final scheme = Theme.of(context).colorScheme;
+    final color = active ? scheme.tertiary : scheme.primary;
     return SizedBox(
       width: 44,
       height: 44,
@@ -7798,95 +8151,6 @@ class _ChevronPainter extends CustomPainter {
   @override
   bool shouldRepaint(covariant _ChevronPainter oldDelegate) {
     return oldDelegate.color != color || oldDelegate.thickness != thickness || oldDelegate.right != right;
-  }
-}
-
-/// Progress dialog that owns the tile prefetch and always pops itself.
-class _CacheMapDialog extends StatefulWidget {
-  const _CacheMapDialog({
-    required this.bounds,
-    required this.urlTemplate,
-  });
-
-  final LatLngBounds bounds;
-  final String urlTemplate;
-
-  @override
-  State<_CacheMapDialog> createState() => _CacheMapDialogState();
-}
-
-class _CacheMapDialogState extends State<_CacheMapDialog> {
-  int _done = 0;
-  int _total = 0;
-  bool _cancelled = false;
-  bool _finished = false;
-
-  @override
-  void initState() {
-    super.initState();
-    WidgetsBinding.instance.addPostFrameCallback((_) => _run());
-  }
-
-  Future<void> _run() async {
-    var done = 0;
-    try {
-      done = await MapTileCache.prefetchBounds(
-        bounds: widget.bounds,
-        urlTemplate: widget.urlTemplate,
-        minZoom: 13,
-        maxZoom: 16,
-        maxTiles: 2500,
-        isCancelled: () => _cancelled,
-        onProgress: (d, t) {
-          if (!mounted || _cancelled) return;
-          setState(() {
-            _done = d;
-            _total = t;
-          });
-        },
-      );
-    } catch (_) {
-      // Still dismiss so the UI never sticks.
-    }
-    if (!mounted || _finished) return;
-    _finished = true;
-    Navigator.of(context).pop((done: done, cancelled: _cancelled));
-  }
-
-  void _cancel() {
-    if (_finished) return;
-    setState(() => _cancelled = true);
-  }
-
-  @override
-  Widget build(BuildContext context) {
-    return PopScope(
-      canPop: false,
-      child: AlertDialog(
-        title: const Text('Caching map'),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            LinearProgressIndicator(
-              value: _total > 0 ? (_done / _total).clamp(0.0, 1.0) : null,
-            ),
-            const SizedBox(height: 12),
-            Text(
-              _cancelled
-                  ? 'Stopping…'
-                  : (_total > 0 ? '$_done / $_total tiles' : 'Preparing…'),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: _cancelled ? null : _cancel,
-            child: const Text('Cancel'),
-          ),
-        ],
-      ),
-    );
   }
 }
 

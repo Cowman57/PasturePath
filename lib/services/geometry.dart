@@ -707,6 +707,63 @@ List<List<LatLng>> splitPathAtJumps(List<LatLng> path, {double maxJumpM = 40}) {
   return segments;
 }
 
+/// Midpoint of the edge before or after [vertexIdx], or null when it can't be
+/// derived (ring too short or index out of range).
+LatLng? adjacentEdgeMidpoint(
+  List<LatLng> ring,
+  int vertexIdx, {
+  required bool before,
+}) {
+  if (ring.length < 2 || vertexIdx < 0 || vertexIdx >= ring.length) return null;
+  final n = ring.length;
+  final anchor = ring[vertexIdx];
+  final neighbour =
+      before ? ring[(vertexIdx - 1 + n) % n] : ring[(vertexIdx + 1) % n];
+  return LatLng(
+    (anchor.latitude + neighbour.latitude) / 2.0,
+    (anchor.longitude + neighbour.longitude) / 2.0,
+  );
+}
+
+/// Inserts [point] on the edge before or after [vertexIdx].
+///
+/// Used when the operator has a vertex grabbed: "insert at the crosshair" is
+/// ambiguous there because the crosshair sits exactly on that vertex, so both
+/// adjacent edges are zero distance away.
+///
+/// Returns a new ring; [ring] is not mutated.
+List<LatLng> insertVertexAdjacentTo(
+  List<LatLng> ring,
+  int vertexIdx, {
+  required bool before,
+  required LatLng point,
+}) {
+  if (ring.length < 2 || vertexIdx < 0 || vertexIdx >= ring.length) {
+    return List<LatLng>.from(ring);
+  }
+  final out = List<LatLng>.from(ring);
+  out.insert(before ? vertexIdx : vertexIdx + 1, point);
+  return out;
+}
+
+/// Inserts a vertex at the midpoint of the edge before or after [vertexIdx].
+///
+/// Returns a new ring; [ring] is not mutated.
+List<LatLng> insertMidpointAdjacentTo(
+  List<LatLng> ring,
+  int vertexIdx, {
+  required bool before,
+}) {
+  final midpoint = adjacentEdgeMidpoint(ring, vertexIdx, before: before);
+  if (midpoint == null) return List<LatLng>.from(ring);
+  return insertVertexAdjacentTo(
+    ring,
+    vertexIdx,
+    before: before,
+    point: midpoint,
+  );
+}
+
 /// Splits [path] into runs of continuous travel, marking each as reversing or
 /// forward.
 ///

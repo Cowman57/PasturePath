@@ -151,6 +151,26 @@ class BackupStore {
     );
   }
 
+  /// Writes [bytes] into the phone's Downloads folder as [fileName].
+  ///
+  /// Returns true when the copy succeeded, null when Downloads could not be
+  /// reached (the caller can still report that the file was produced).
+  static Future<bool?> saveBytesToDownloads({
+    required List<int> bytes,
+    required String fileName,
+  }) async {
+    final docs = await getApplicationDocumentsDirectory();
+    final tmp = io.File('${docs.path}/$fileName');
+    await tmp.writeAsBytes(bytes, flush: true);
+    try {
+      return await copyFileIntoDownloadFolder(tmp.path, fileName);
+    } finally {
+      try {
+        if (await tmp.exists()) await tmp.delete();
+      } catch (_) {}
+    }
+  }
+
   static Future<void> _collectBackupsFromDir(
     String dirPath,
     List<BackupInfo> out,
