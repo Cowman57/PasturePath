@@ -4874,13 +4874,11 @@ _coverageDistanceCacheM = 0.0;
       if (weatherLoc == null && jobIdx.isNotEmpty) {
         weatherLoc = _paddocks[jobIdx.first].labelPoint;
       }
-      JobWeather? weather;
-      if (weatherLoc != null) {
-        weather = await WeatherService.fetchForJob(
-          location: weatherLoc,
-          at: end,
-        );
-      }
+      // Weather is advisory, so it must never hold the save up: awaiting it here
+      // meant finishing in a paddock with no signal sat on "Saving…" for the
+      // whole HTTP timeout (~10 s). Saved without it, then patched in below.
+      const JobWeather? weather = null;
+      final LatLng? weatherAt = weatherLoc;
 
       final job = SavedJob(
         id: id,
@@ -4923,12 +4921,19 @@ _coverageDistanceCacheM = 0.0;
         _lookAheadNotifier.value = null;
         _completedJobSummary = job;
         _prepareCompletedReadingField(_openLoadSession);
-        _showCompletedJobOnMap(job);
         _invalidateJobSummariesCache();
+      });
+      // Painting the finished swath is heavy; do it after the summary is on
+      // screen so the frame that dismisses the spinner isn't blocked by it.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) _showCompletedJobOnMap(job);
       });
       // Nav has ended: let the screen sleep again.
       _updateWakeLock();
       _restoreSavedMapView();
+
+      // Best effort: fetch weather once the map is back and re-save quietly.
+      unawaited(_attachWeatherLater(job, weatherAt, end));
     } catch (e) {
       if (mounted) {
         if (Navigator.of(context, rootNavigator: true).canPop()) {
@@ -4943,6 +4948,35 @@ _coverageDistanceCacheM = 0.0;
       }
     } finally {
       _jobFinishInProgress = false;
+    }
+  }
+
+  /// Fetches weather for a just-saved [job] after the UI has been released, then
+  /// re-saves it. Purely additive: offline, the job simply keeps no weather.
+  Future<void> _attachWeatherLater(
+    SavedJob job,
+    LatLng? location,
+    DateTime at,
+  ) async {
+    if (location == null) return;
+    try {
+      final weather = await WeatherService.fetchForJob(
+        location: location,
+        at: at,
+      );
+      if (weather == null) return;
+
+      final updated = job.copyWith(weather: weather);
+      await JobStore.save(updated);
+      if (!mounted) return;
+      setState(() {
+        if (_completedJobSummary?.id == job.id) {
+          _completedJobSummary = updated;
+        }
+      });
+      _invalidateJobSummariesCache();
+    } catch (_) {
+      // Offline or provider hiccup - history just shows no weather.
     }
   }
 
