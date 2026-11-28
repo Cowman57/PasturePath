@@ -454,6 +454,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   final ValueNotifier<int> _navHudTickNotifier = ValueNotifier(0);
   /// Boom points already polygonised into [_committedSwathPolys].
   int _swathCommittedBoomLen = 0;
+  /// Ribbons for completed passes (sealed once) and for the pass being driven.
+  final List<Polygon> _swathSealedPolys = [];
+  final List<Polygon> _swathOpenPolys = [];
+  /// Display-path index already sealed into [_swathSealedPolys].
+  int _swathSealedUpto = 0;
   int _lastSwathCommitMs = 0;
   /// USB NMEA emits RMC+GGA(+GLL) per epoch — only sample once per ~25 Hz slot.
   int? _lastSwathRecordBucket;
@@ -2247,7 +2252,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     if (!mounted || _gpsSmoothness <= 0) return;
 
     _gpsSmoother.smoothness = _gpsSmoothness;
-    _gpsSmoother.tick(DateTime.now());
+    final animating = _gpsSmoother.tick(DateTime.now());
 
     _syncDisplayFromSmoother();
     _updateImplementGeometry();
@@ -2261,6 +2266,11 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _maybeAutoSelectPaddockFromGps();
     _applyDisplayCamera();
     _notifyDisplayPosition();
+
+    // Interpolation has settled: nothing to animate until the next fix, so stop
+    // ticking instead of burning frame budget while parked. The fix handler
+    // restarts it through _ensureGpsSmoothTickerRunning().
+    if (!animating) _gpsSmoothTicker?.stop();
   }
 
   /// Camera rotation (degrees, flutter_map convention) for the current rotation
@@ -3735,6 +3745,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
 
   void _clearSwathDisplay() {
     _committedSwathPolys.clear();
+    _swathSealedPolys.clear();
+    _swathOpenPolys.clear();
+    _swathSealedUpto = 0;
     _swathCommittedBoomLen = 0;
     _lastSwathCommitMs = 0;
     _swathCommittedNotifier.value = [];
@@ -3786,15 +3799,40 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _swathLiveNotifier.value = _swathPolygonFromRing(ring);
   }
 
-  /// Rebuild continuous swath polygons from the boom path (throttled).
-  /// Chunked append left hairline gaps at every join; one ring set stays filled.
+  /// Ribbon building is O(path length), so long jobs get a slower cadence rather
+  /// than re-ribboning everything 2.5 times a second.
+  int _swathCommitIntervalFor(int boomLen) {
+    if (boomLen < 2000) return _swathCommitIntervalMs;
+    if (boomLen < 6000) return _swathCommitIntervalMs * 2;
+    return _swathCommitIntervalMs * 3;
+  }
+
+  /// One ribbon for a single continuous pass, or null when it is degenerate.
+  Polygon? _swathRibbonFor(List<LatLng> segment, double widthM) {
+    final simplified = simplifySwathPath(segment);
+    if (simplified.length < 2) return null;
+    final ring = buildSwathRingFromPath(simplified, widthM);
+    if (ring.length < 3) return null;
+    return _swathPolygonFromRing(ring);
+  }
+
+  /// Rebuild swath polygons from the boom path (throttled, incremental).
+  ///
+  /// A completed pass is ribboned once and sealed; only the pass still being
+  /// driven is rebuilt. Previously every commit re-ribboned the entire job,
+  /// which made the cost grow without bound through the day.
   void _maybeCommitSwath({bool force = false}) {
     if (!_navMode) return;
     final boom = _jobPath;
     if (boom.length < 2) return;
 
     final ms = DateTime.now().millisecondsSinceEpoch;
-    if (!force && ms - _lastSwathCommitMs < _swathCommitIntervalMs) return;
+    if (!force && ms - _lastSwathCommitMs < _swathCommitIntervalFor(boom.length)) {
+      return;
+    }
+
+    // Nothing new recorded since the last commit.
+    if (!force && boom.length == _swathCommittedBoomLen) return;
 
     if (!force && _swathCommittedBoomLen > 0) {
       var advanceM = 0.0;
@@ -3814,12 +3852,31 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         : List<LatLng>.from(boom);
     if (displayPath.length < 2) return;
 
-    final rings = buildSwathRingsFromPath(displayPath, _currentSwathWidthM());
-    _committedSwathPolys.clear();
-    for (final ring in rings) {
-      final poly = _swathPolygonFromRing(ring);
-      if (poly != null) _committedSwathPolys.add(poly);
+    final width = _currentSwathWidthM();
+    final starts = swathSegmentStarts(displayPath);
+    if (starts.isEmpty) return;
+
+    // Seal every segment that is no longer the last one. Each is ribboned once
+    // and then left alone, so total work is linear in the job, not quadratic.
+    for (var k = 0; k < starts.length - 1; k++) {
+      final start = starts[k];
+      if (start < _swathSealedUpto) continue;
+      final end = starts[k + 1];
+      final poly = _swathRibbonFor(displayPath.sublist(start, end), width);
+      if (poly != null) _swathSealedPolys.add(poly);
+      _swathSealedUpto = end;
     }
+
+    // Only the pass still being driven is rebuilt each commit.
+    final openPoly = _swathRibbonFor(displayPath.sublist(starts.last), width);
+    _swathOpenPolys
+      ..clear()
+      ..addAll(openPoly == null ? const <Polygon>[] : <Polygon>[openPoly]);
+
+    _committedSwathPolys
+      ..clear()
+      ..addAll(_swathSealedPolys)
+      ..addAll(_swathOpenPolys);
     _swathCommittedNotifier.value = List<Polygon>.from(_committedSwathPolys);
   }
 

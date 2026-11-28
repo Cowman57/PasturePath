@@ -96,6 +96,30 @@ void main() {
       }
     });
 
+    test('segment starts match the ribbons the builder produces', () {
+      // The live swath seals a finished segment once and rebuilds only the open
+      // one, so its segmentation must agree exactly with the batch builder.
+      final cases = <List<LatLng>>[
+        pathThroughLegs([20]),
+        pathThroughLegs([20, 10, 30]),
+        [
+          for (var i = 0; i <= 10; i++) atNorth(i.toDouble()),
+          // 50 m gap: a jump split, not a reversal.
+          for (var i = 60; i <= 70; i++) atNorth(i.toDouble()),
+        ],
+      ];
+
+      for (final path in cases) {
+        final starts = swathSegmentStarts(path);
+        final rings = buildSwathRingsFromPath(path, 3.0);
+        expect(
+          starts.length,
+          rings.length,
+          reason: 'starts=$starts ribbons=${rings.length}',
+        );
+      }
+    });
+
     test('a straight run is still a single ribbon', () {
       final path = pathThroughLegs([30]);
       final rings = buildSwathRingsFromPath(path, 3.0);

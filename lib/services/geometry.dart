@@ -834,6 +834,52 @@ List<List<LatLng>> forwardRunsOnly(
   ];
 }
 
+/// Start indices of the segments that [buildSwathRingsFromPath] would ribbon.
+///
+/// Same break rules as `splitPathAtJumps` (gap > [maxJumpM]) followed by
+/// `splitPathAtReversals` (a step more than [maxReverseDeg] off the previous
+/// one). Returning indices instead of copied point lists lets the live swath
+/// seal a finished segment once and rebuild only the one still being driven,
+/// instead of re-ribboning the whole job every commit.
+///
+/// Each segment runs from `starts[k]` up to (excluding) `starts[k + 1]`; the
+/// last runs to the end of the path. Segments shorter than two points are
+/// omitted, matching the splitters.
+List<int> swathSegmentStarts(
+  List<LatLng> path, {
+  double maxJumpM = 40,
+  double maxReverseDeg = 95,
+}) {
+  if (path.isEmpty) return const [];
+
+  final starts = <int>[];
+  var segStart = 0;
+  var segLen = 1;
+
+  for (var i = 1; i < path.length; i++) {
+    final isJump = _distMeters(path[i - 1], path[i]) > maxJumpM;
+    final isReversal = !isJump &&
+        segLen >= 2 &&
+        isBackwardGpsStep(
+          path[i - 1],
+          path[i - 2],
+          path[i],
+          maxReverseDeg: maxReverseDeg,
+        );
+
+    if (isJump || isReversal) {
+      if (segLen >= 2) starts.add(segStart);
+      segStart = i;
+      segLen = 1;
+      continue;
+    }
+    segLen++;
+  }
+
+  if (segLen >= 2) starts.add(segStart);
+  return starts;
+}
+
 /// One closed ring per continuous path segment.
 ///
 /// Splits at jumps and reversals so a reversal becomes its own ribbon instead of
