@@ -79,13 +79,15 @@ void main() {
       expect(runs.single.reversing, isFalse);
     });
 
-    test('a reversal produces its own swath ribbons, not one chord', () {
+    test('a reversal produces its own ribbon, never one chord', () {
       final path = pathThroughLegs([20, 10, 30]);
       final rings = buildSwathRingsFromPath(path, 3.0);
 
-      // Two forward legs → two ribbons. A single ring would mean the reversed
-      // section was painted as one straight strip across the corner.
-      expect(rings.length, 2);
+      // Forward / reversing / forward -> three ribbons. The reversing leg is
+      // kept (a 180 degree headland turn looks identical by bearing, so runs
+      // must never be discarded) but split out, so nothing is painted as one
+      // straight strip across the corner.
+      expect(rings.length, 3);
 
       // Each ribbon is a valid polygon outline (flutter_map closes the ring on
       // render, so the points themselves need not repeat the first vertex).

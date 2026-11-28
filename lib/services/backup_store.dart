@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../models/job.dart';
 import 'job_store.dart';
 import 'load_session_store.dart';
+import 'map_style_store.dart';
 
 class BackupInfo {
   final String path;
@@ -61,6 +62,9 @@ class BackupStore {
     'gpsPreferredPid',
     // Stored as a JSON string in shared prefs rather than a scalar setting.
     'paddockWorkList',
+    // Settings → Colours.
+    ...MapStyle.colorKeys,
+    ...MapStyle.opacityKeys,
   ];
 
   static Future<String> backupsDir() async {

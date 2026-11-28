@@ -834,20 +834,21 @@ List<List<LatLng>> forwardRunsOnly(
   ];
 }
 
-/// One closed ring per continuous forward path segment.
+/// One closed ring per continuous path segment.
+///
+/// Splits at jumps and reversals so a reversal becomes its own ribbon instead of
+/// folding back over the previous one, but **never discards a run**. A 180°
+/// headland turn is indistinguishable from a reversal by bearing alone, so
+/// dropping "reversing" runs painted only every second pass - and if the
+/// direction state latched wrong, the swath stopped for the rest of the job.
 List<List<LatLng>> buildSwathRingsFromPath(List<LatLng> path, double widthM) {
   final rings = <List<LatLng>>[];
-  // Split by travel direction BEFORE any filtering: filtering first deletes the
-  // reversal points, which then paints a phantom straight strip across the
-  // corner instead of leaving it uncovered.
   for (final jumpSeg in splitPathAtJumps(path)) {
-    for (final forwardRun in forwardRunsOnly(jumpSeg)) {
-      for (final seg in splitPathAtReversals(forwardRun)) {
-        final simplified = simplifySwathPath(seg);
-        if (simplified.length < 2) continue;
-        final ring = buildSwathRingFromPath(simplified, widthM);
-        if (ring.length >= 3) rings.add(ring);
-      }
+    for (final seg in splitPathAtReversals(jumpSeg)) {
+      final simplified = simplifySwathPath(seg);
+      if (simplified.length < 2) continue;
+      final ring = buildSwathRingFromPath(simplified, widthM);
+      if (ring.length >= 3) rings.add(ring);
     }
   }
   return rings;

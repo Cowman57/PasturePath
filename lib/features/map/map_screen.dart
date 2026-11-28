@@ -33,6 +33,7 @@ import '../../services/geometry.dart';
 import '../../services/geojson_parser.dart';
 import '../../services/kml_parser.dart';
 import '../../services/farm_map_exporter.dart';
+import '../../services/map_style_store.dart';
 import '../../services/gps_display_smoother.dart';
 import '../../services/gps/gps_input_controller.dart';
 import '../../services/gps/gps_source.dart';
@@ -41,6 +42,7 @@ import '../../models/tool_setup_dimensions.dart';
 import '../../services/tool_preset_store.dart';
 import '../../services/update_service.dart';
 import '../../widgets/animated_popup.dart';
+import '../../widgets/colour_picker_dialog.dart';
 import '../../widgets/navigation_arrow_icon.dart';
 import '../../widgets/work_list_sheet.dart';
 import 'tool_setup_tab.dart';
@@ -330,15 +332,23 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   List<OrthoLayer> _orthoLayers = [];
   bool _orthoImporting = false;
 
-  static const Color _overlayColor = Colors.green;
-  static const double _overlayOpacity = 0.20;
-  static const Color _guidanceColor = Colors.white;
-  static const Color _headingColor = Colors.blueAccent;
+  /// User-tunable colours (Settings → Colours). Exposed behind the same getter
+  /// names the drawing code always used, so every render site follows the
+  /// operator's choice without touching it.
+  MapStyle _mapStyle = MapStyle.defaults();
+
+  Color get _overlayColor => _mapStyle.paddockFillColor;
+  double get _overlayOpacity => _mapStyle.paddockFillOpacity;
+  Color get _guidanceColor => _mapStyle.guidanceColor;
+  Color get _headingColor => _mapStyle.headingColor;
+  Color get _trackColor => _mapStyle.trackColor;
+  double get _trackOpacity => _mapStyle.trackOpacity;
+  Color get _swathColor => _mapStyle.swathColor;
+  double get _swathOpacity => _mapStyle.swathOpacity;
+
   static const double _headingLengthM = 12.0;
   static const double _headingWidth = 3.5;
   static const bool _headingDashed = false;
-  static const Color _swathColor = Colors.lightGreenAccent;
-  static const double _swathOpacity = 0.55;
 
   double get _width => _toolDims.width;
   double get _offset => _toolDims.boomLateralOffset;
@@ -390,6 +400,8 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   static const double _guidanceAlongTrackMargin = 1.5;
   static const int _navLogicIntervalMs = 200;
   static const double _cameraMoveThresholdM = 0.35;
+  /// In nav the map is re-centred when it drifts this far from the tractor.
+  static const double _navFollowDriftM = 1.5;
   static const int _guidanceScanRadius = 3;
   int _lastNavLogicMs = 0;
   /// Desired follow aim (GPS). Separate from camera center so chase can finish.
@@ -1146,7 +1158,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
   Future<void> _loadPrefs() async {
     final p = await SharedPreferences.getInstance();
     final gpsMode = GpsInputModeX.fromPrefs(p.getString('gpsInputMode'));
+    final style = await MapStyle.load();
     setState(() {
+      _mapStyle = style;
       _units = p.getString('units') ?? 'meters';
       _toolDims = ToolSetupDimensions(
         width: p.getDouble('width') ?? 3.0,
@@ -2295,6 +2309,14 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
               threshold) {
         _lastCameraTarget = _dispPos;
       }
+      // Nav forces follow: if the camera has been dragged off the tractor - a
+      // stray pan, or standing still so no GPS threshold trips - pull it back.
+      if (_navMode &&
+          _mapReady &&
+          distanceMetersBetween(_mapController.camera.center, _dispPos!) >=
+              _navFollowDriftM) {
+        _lastCameraTarget = _dispPos;
+      }
       aimCenter = _lastCameraTarget;
     }
 
@@ -2528,6 +2550,74 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  /// One row in Settings → Colours: swatch, name and current opacity.
+  Widget _colourRow({
+    required String label,
+    required Color color,
+    double? opacity,
+    required VoidCallback onTap,
+  }) {
+    final scheme = Theme.of(context).colorScheme;
+    return ListTile(
+      dense: true,
+      contentPadding: const EdgeInsets.only(left: 24, right: 12),
+      leading: Container(
+        width: 26,
+        height: 26,
+        decoration: BoxDecoration(
+          color: color.withValues(alpha: opacity ?? 1.0),
+          shape: BoxShape.circle,
+          border: Border.all(color: scheme.outlineVariant),
+        ),
+      ),
+      title: Text(label),
+      subtitle: opacity == null ? null : Text('${(opacity * 100).round()}%'),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: onTap,
+    );
+  }
+
+  /// Opens the palette for one item, then repaints everything that uses it.
+  Future<void> _editColour(
+    String title,
+    Color color,
+    double? opacity,
+    MapStyle Function(ColourPick pick) apply,
+  ) async {
+    final picked = await showColourPicker(
+      context: context,
+      title: title,
+      color: color,
+      opacity: opacity,
+    );
+    if (picked == null || !mounted) return;
+
+    final next = apply(picked);
+    setState(() => _mapStyle = next);
+    await next.save();
+    if (!mounted) return;
+    _repaintForStyleChange();
+  }
+
+  Future<void> _resetColours() async {
+    final defaults = MapStyle.defaults();
+    setState(() => _mapStyle = defaults);
+    await defaults.save();
+    if (!mounted) return;
+    _repaintForStyleChange();
+  }
+
+  /// Colours are read while the layers are built, so anything already on screen
+  /// has to be rebuilt explicitly.
+  void _repaintForStyleChange() {
+    _rebuildPaddockLayers();
+    _syncNavLinePolylines();
+    if (!_navMode) return;
+    _maybeCommitSwath(force: true);
+    _syncLiveSwathTip();
+    _updateLookAhead();
   }
 
   Widget _jobSideRail({
@@ -3287,6 +3377,9 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     }
     if (!hasGesture || _showingHistory) return;
     _stopCameraSwoop();
+    // Nav forces follow: a pan is ignored rather than stopping the map tracking
+    // the tractor. Outside nav, panning releases follow so the view stays put.
+    if (_navMode) return;
     // Stop follow immediately so controller moves don't fight the pan gesture.
     if (_followGps) {
       setState(() => _followGps = false);
@@ -3419,19 +3512,19 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
       var borderW = 2.0;
       var extraFill = 0.0;
       if (isSel) {
-        border = Colors.yellow.shade700;
+        border = _mapStyle.paddockSelectedColor;
         borderW = 3.5;
         extraFill = 0.08;
       } else if (listDone) {
-        border = Colors.teal.shade700;
+        border = _mapStyle.paddockDoneColor;
         borderW = 3.0;
         extraFill = 0.10;
       } else if (inList) {
-        border = Colors.orange.shade800;
+        border = _mapStyle.paddockListedColor;
         borderW = 3.0;
         extraFill = 0.10;
       } else {
-        border = _overlayColor;
+        border = _mapStyle.paddockOutlineColor;
       }
       polys.add(
         Polygon(
@@ -3752,7 +3845,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _navPathCommittedNotifier.value = Polyline(
       points: List<LatLng>.from(_jobPath),
       strokeWidth: 2.5,
-      color: _swathColor.withValues(alpha: _swathOpacity),
+      color: _trackColor.withValues(alpha: _trackOpacity),
     );
   }
 
@@ -3776,7 +3869,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _navPathTailNotifier.value = Polyline(
       points: [last, tip],
       strokeWidth: 2.5,
-      color: _swathColor.withValues(alpha: _swathOpacity),
+      color: _trackColor.withValues(alpha: _trackOpacity),
     );
   }
 
@@ -3866,7 +3959,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
     _lookAheadNotifier.value = Polyline(
       points: [_dispPos!, end],
       strokeWidth: _headingWidth.clamp(2.0, 12.0),
-      color: _headingColor.withValues(alpha: 0.95),
+      color: _headingColor.withValues(alpha: _mapStyle.headingOpacity),
       isDotted: _headingDashed,
     );
   }
@@ -3880,7 +3973,7 @@ class _MapScreenState extends State<MapScreen> with TickerProviderStateMixin {
         if (seg.length < 2) continue;
         polys.add(Polyline(
           points: seg,
-          color: _guidanceColor,
+          color: _guidanceColor.withValues(alpha: _mapStyle.guidanceOpacity),
           strokeWidth: active ? 4.0 : 2.2,
           isDotted: !active,
         ));
@@ -5372,6 +5465,149 @@ _coverageDistanceCacheM = 0.0;
           ),
         ),
         const Divider(),
+        ExpansionTile(
+          leading: const Icon(Icons.palette_outlined),
+          title: const Text(
+            'Colours',
+            style: TextStyle(fontWeight: FontWeight.bold),
+          ),
+          subtitle: const Text('Map colours and opacity'),
+          childrenPadding: EdgeInsets.zero,
+          children: [
+            _colourRow(
+              label: 'Swath',
+              color: _mapStyle.swathColor,
+              opacity: _mapStyle.swathOpacity,
+              onTap: () => _editColour(
+                'Swath',
+                _mapStyle.swathColor,
+                _mapStyle.swathOpacity,
+                (p) => _mapStyle.copyWith(
+                  swathColor: p.color,
+                  swathOpacity: p.opacity,
+                ),
+              ),
+            ),
+            _colourRow(
+              label: 'Path / track',
+              color: _mapStyle.trackColor,
+              opacity: _mapStyle.trackOpacity,
+              onTap: () => _editColour(
+                'Path / track',
+                _mapStyle.trackColor,
+                _mapStyle.trackOpacity,
+                (p) => _mapStyle.copyWith(
+                  trackColor: p.color,
+                  trackOpacity: p.opacity,
+                ),
+              ),
+            ),
+            _colourRow(
+              label: 'Paddock fill',
+              color: _mapStyle.paddockFillColor,
+              opacity: _mapStyle.paddockFillOpacity,
+              onTap: () => _editColour(
+                'Paddock fill',
+                _mapStyle.paddockFillColor,
+                _mapStyle.paddockFillOpacity,
+                (p) => _mapStyle.copyWith(
+                  paddockFillColor: p.color,
+                  paddockFillOpacity: p.opacity,
+                ),
+              ),
+            ),
+            _colourRow(
+              label: 'Paddock outline',
+              color: _mapStyle.paddockOutlineColor,
+              onTap: () => _editColour(
+                'Paddock outline',
+                _mapStyle.paddockOutlineColor,
+                null,
+                (p) => _mapStyle.copyWith(paddockOutlineColor: p.color),
+              ),
+            ),
+            _colourRow(
+              label: 'Selected paddock',
+              color: _mapStyle.paddockSelectedColor,
+              onTap: () => _editColour(
+                'Selected paddock',
+                _mapStyle.paddockSelectedColor,
+                null,
+                (p) => _mapStyle.copyWith(paddockSelectedColor: p.color),
+              ),
+            ),
+            _colourRow(
+              label: 'Paddock on the list',
+              color: _mapStyle.paddockListedColor,
+              onTap: () => _editColour(
+                'Paddock on the list',
+                _mapStyle.paddockListedColor,
+                null,
+                (p) => _mapStyle.copyWith(paddockListedColor: p.color),
+              ),
+            ),
+            _colourRow(
+              label: 'Completed paddock',
+              color: _mapStyle.paddockDoneColor,
+              onTap: () => _editColour(
+                'Completed paddock',
+                _mapStyle.paddockDoneColor,
+                null,
+                (p) => _mapStyle.copyWith(paddockDoneColor: p.color),
+              ),
+            ),
+            _colourRow(
+              label: 'Guidance lines',
+              color: _mapStyle.guidanceColor,
+              opacity: _mapStyle.guidanceOpacity,
+              onTap: () => _editColour(
+                'Guidance lines',
+                _mapStyle.guidanceColor,
+                _mapStyle.guidanceOpacity,
+                (p) => _mapStyle.copyWith(
+                  guidanceColor: p.color,
+                  guidanceOpacity: p.opacity,
+                ),
+              ),
+            ),
+            _colourRow(
+              label: 'Heading line',
+              color: _mapStyle.headingColor,
+              opacity: _mapStyle.headingOpacity,
+              onTap: () => _editColour(
+                'Heading line',
+                _mapStyle.headingColor,
+                _mapStyle.headingOpacity,
+                (p) => _mapStyle.copyWith(
+                  headingColor: p.color,
+                  headingOpacity: p.opacity,
+                ),
+              ),
+            ),
+            _colourRow(
+              label: 'GPS cursor',
+              color: _mapStyle.cursorColor,
+              onTap: () => _editColour(
+                'GPS cursor',
+                _mapStyle.cursorColor,
+                null,
+                (p) => _mapStyle.copyWith(cursorColor: p.color),
+              ),
+            ),
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Padding(
+                padding: const EdgeInsets.only(left: 12),
+                child: TextButton.icon(
+                  onPressed: _resetColours,
+                  icon: const Icon(Icons.restart_alt, size: 18),
+                  label: const Text('Reset to defaults'),
+                ),
+              ),
+            ),
+          ],
+        ),
+        const Divider(),
 
         const ListTile(title: Text('Farm JSON', style: TextStyle(fontWeight: FontWeight.bold))),
         ListTile(
@@ -6071,7 +6307,7 @@ _coverageDistanceCacheM = 0.0;
         paths.add(Polyline(
           points: job.path,
           strokeWidth: 2.5,
-          color: _swathColor.withValues(alpha: _swathOpacity),
+          color: _trackColor.withValues(alpha: _trackOpacity),
         ));
       }
     }
@@ -6903,6 +7139,7 @@ _coverageDistanceCacheM = 0.0;
                 child: NavigationArrowIcon(
                   size: iconSize,
                   headingDeg: _dispHeadingNotifier.value,
+                  color: _mapStyle.cursorColor,
                 ),
               ),
             ],
@@ -6943,7 +7180,9 @@ _coverageDistanceCacheM = 0.0;
             height: 18,
             decoration: BoxDecoration(
               shape: BoxShape.circle,
-              color: _guidanceColor.withValues(alpha: 0.95),
+              color: _guidanceColor.withValues(
+                alpha: _mapStyle.guidanceOpacity,
+              ),
               border: Border.all(color: Colors.white, width: 2.5),
               boxShadow: const [BoxShadow(color: Colors.black38, blurRadius: 4)],
             ),
@@ -6965,7 +7204,9 @@ _coverageDistanceCacheM = 0.0;
             polylines: [
               Polyline(
                 points: [pos, _pointA!],
-                color: _guidanceColor.withValues(alpha: 0.85),
+                color: _guidanceColor.withValues(
+                  alpha: (_mapStyle.guidanceOpacity * 0.85).clamp(0.0, 1.0),
+                ),
                 strokeWidth: 3.5,
                 isDotted: true,
               ),
